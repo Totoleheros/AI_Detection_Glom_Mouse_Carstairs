@@ -1,60 +1,60 @@
-# Pipeline de détection et classification de glomérules rénaux
-**QuPath 0.7.0 + StarDist custom + Apple Silicon (M1 Max)**  
-Coloration : Carstairs | Images : Brightfield JPEG (~28928 × 16240 px)
+# Glomerulus Detection and Classification Pipeline
+**QuPath 0.7.0 + Custom StarDist + Apple Silicon (M1 Max)**  
+Staining: Carstairs | Images: Brightfield JPEG (~28928 × 16240 px)
 
 ---
 
-## Contexte
+## Context
 
-Pipeline semi-automatique pour :
-1. Détecter les glomérules sur des coupes de rein (Brightfield, Carstairs)
-2. Les classifier selon leur état pathologique (Sain vs Pathologique)
+Semi-automated pipeline for:
+1. Detecting glomeruli on kidney sections (Brightfield, Carstairs staining)
+2. Classifying them by pathological status (Healthy vs Pathological)
 
-**Environnement cible :** Mac M1 Max, QuPath 0.7.0-arm64, Python via Miniforge
+**Target environment:** Mac M1 Max, QuPath 0.7.0-arm64, Python via Miniforge
 
 ---
 
-## Voies abandonnées (et pourquoi)
+## Abandoned Approaches (and Why)
 
-| Approche | Raison d'abandon |
+| Approach | Reason for Abandonment |
 |---|---|
-| StarDist avec modèle pré-entraîné `he_heavy_augment.pb` | Détecte des noyaux individuels, pas des glomérules entiers |
-| BioImage.IO Model Zoo | Aucun modèle glomérule/kidney disponible |
-| Cellpose | Conçu pour cellules individuelles — pas adapté à des structures de ~200 µm complexes |
-| Pixel Classifier Random Forest seul | Plafond de performance insuffisant pour un pipeline durable |
-| Déconvolution couleur (Visual Stain Editor) | Non applicable à la coloration Carstairs (conçu pour H&E et H-DAB uniquement) |
+| StarDist with pre-trained model `he_heavy_augment.pb` | Detects individual nuclei, not whole glomeruli |
+| BioImage.IO Model Zoo | No glomerulus/kidney model available |
+| Cellpose | Designed for individual cells — not suited for ~200 µm complex structures |
+| Random Forest Pixel Classifier alone | Performance ceiling insufficient for a robust long-term pipeline |
+| Color deconvolution (Visual Stain Editor) | Not applicable to Carstairs staining (designed for H&E and H-DAB only) |
 
 ---
 
-## Architecture retenue
+## Retained Architecture
 
 ```
-102 annotations manuelles QuPath (ground truth)
+102 manual QuPath annotations (ground truth)
             ↓
-     Export patches PNG + masques
-     (script Groovy : export_training_patches.groovy)
+     Export patches PNG + masks
+     (Groovy script: export_training_patches.groovy)
             ↓
-  Entraînement StarDist custom
-  (Python, TensorFlow Metal, GPU M1 Max, ~45 min)
+  Custom StarDist training
+  (Python, TensorFlow Metal, M1 Max GPU, ~45 min)
             ↓
-  Modèle "glomerulus_carstairs"
+  Model "glomerulus_carstairs"
             ↓
-  Détection automatique dans QuPath
-  (StarDist brightfield script, canal vert)
+  Automated detection in QuPath
+  (StarDist brightfield script, green channel)
             ↓
-  Classification Sain/Pathologique
-  (Object Classifier QuPath)
+  Healthy/Pathological classification
+  (QuPath Object Classifier)
 ```
 
 ---
 
-## PARTIE 1 — Installation de l'environnement
+## PART 1 — Environment Setup
 
 ### 1.1 QuPath
 
-- Télécharger **QuPath 0.7.0-arm64** : https://qupath.github.io
-- Installer dans `/Applications/`
-- Vérifier : `Help → About QuPath` → Architecture = `aarch64`
+- Download **QuPath 0.7.0-arm64**: https://qupath.github.io
+- Install in `/Applications/`
+- Verify: `Help → About QuPath` → Architecture = `aarch64`
 
 ### 1.2 Homebrew
 
@@ -63,78 +63,78 @@ Pipeline semi-automatique pour :
 brew --version
 ```
 
-Résultat attendu :
+Expected output:
 ```
 Homebrew 5.0.16
 ```
 
-### 1.3 Miniforge (conda natif Apple Silicon)
+### 1.3 Miniforge (native Apple Silicon conda)
 
 ```bash
 brew install miniforge
 conda init bash
 ```
 
-Résultat attendu :
+Expected output:
 ```
 modified      /Users/<username>/.bash_profile
 ==> For changes to take effect, close and re-open your current shell. <==
 ```
 
-⚠️ **Fermer le Terminal complètement (Cmd+Q) et le réouvrir.**
+⚠️ **Fully close Terminal (Cmd+Q) and reopen it.**
 
 ```bash
 conda --version
 ```
 
-Résultat attendu :
+Expected output:
 ```
 conda 26.1.1
 ```
 
-> **Note :** Si tu utilises zsh comme shell par défaut, remplace `conda init bash` par `conda init zsh`.
-> Pour vérifier ton shell : `echo $SHELL`
+> **Note:** If your default shell is zsh, replace `conda init bash` with `conda init zsh`.
+> To check your shell: `echo $SHELL`
 
-### 1.4 Environnement Python dédié
+### 1.4 Dedicated Python environment
 
 ```bash
 conda create -n stardist-glom python=3.10 -y
 ```
 
-⚠️ **Fermer le Terminal complètement (Cmd+Q) et le réouvrir.**
+⚠️ **Fully close Terminal (Cmd+Q) and reopen it.**
 
 ```bash
 conda activate stardist-glom
 python --version
 ```
 
-Résultat attendu :
+Expected output:
 ```
 (stardist-glom) user$ python --version
 Python 3.10.20
 ```
 
-> Le préfixe `(stardist-glom)` dans le prompt confirme que l'environnement est actif.
+> The `(stardist-glom)` prefix in the prompt confirms the environment is active.
 
-### 1.5 Installation StarDist + TensorFlow Metal
+### 1.5 StarDist + TensorFlow Metal installation
 
 ```bash
 pip install tensorflow-macos tensorflow-metal
 pip install stardist
 pip install numpy matplotlib tifffile scikit-image csbdeep jupyter
 pip install gputools
-pip install "numpy<2"   # Rétrogradation nécessaire — gputools force numpy 2.x qui casse TF
+pip install "numpy<2"   # Required downgrade — gputools forces numpy 2.x which breaks TensorFlow
 ```
 
-> ⚠️ L'ordre est important : installer `gputools` PUIS rétrograder numpy.
-> Le conflit `reikna` affiché est sans conséquence pour ce pipeline.
+> ⚠️ Order matters: install `gputools` THEN downgrade numpy.
+> The `reikna` conflict warning displayed is harmless for this pipeline.
 
-Vérification :
+Verification:
 ```bash
 python -c "import numpy; print(numpy.__version__); import tensorflow as tf; print(tf.__version__); import stardist; print('StarDist OK')"
 ```
 
-Résultat attendu :
+Expected output:
 ```
 1.26.4
 2.16.2
@@ -143,28 +143,28 @@ StarDist OK
 
 ---
 
-## PARTIE 2 — Préparation du projet QuPath
+## PART 2 — QuPath Project Setup
 
-### 2.1 Création du projet
+### 2.1 Project creation
 
-- Lancer QuPath → `File → New Project`
-- Nommer le projet `GlomAndreMarc`
-- Importer les images (`LysM_01.jpg`, etc.)
+- Launch QuPath → `File → New Project`
+- Name the project `GlomAndreMarc`
+- Import images (`LysM_01.jpg`, etc.)
 
-### 2.2 Annotations manuelles (ground truth)
+### 2.2 Manual annotations (ground truth)
 
-- 102 glomérules annotés manuellement avec l'outil Brush (classe `Glomerulus`)
-- Classes supplémentaires : `Cortex Tissue` (26), `Medulla Tissue` (16), `White` (9)
-- Total : 153 annotations
+- 102 glomeruli manually annotated using the Brush tool (class `Glomerulus`)
+- Additional classes: `Cortex Tissue` (26), `Medulla Tissue` (16), `White` (9)
+- Total: 153 annotations
 
-> Ces 102 annotations constituent le dataset d'entraînement du modèle StarDist custom.  
-> **Ne pas supprimer** — elles serviront aussi à la classification Sain/Pathologique.
+> These 102 annotations form the training dataset for the custom StarDist model.  
+> **Do not delete** — they will also be used for Healthy/Pathological classification.
 
-### 2.3 Export des patches d'entraînement
+### 2.3 Training patch export
 
-Dans QuPath : **`Automate`** → **`Script editor`**
+In QuPath: **`Automate`** → **`Script editor`**
 
-Coller le script suivant → **`File → Save As`** → nommer `export_training_patches.groovy`
+Paste the script below → **`File → Save As`** → name it `export_training_patches.groovy`
 
 ```groovy
 import qupath.lib.regions.RegionRequest
@@ -190,10 +190,10 @@ def annotations = QP.getAnnotationObjects().findAll {
     it.getPathClass().getName() == className
 }
 
-println "→ ${annotations.size()} annotations '${className}' trouvées"
+println "→ ${annotations.size()} '${className}' annotations found"
 
 if (annotations.isEmpty()) {
-    println "⚠ Aucune annotation trouvée. Vérifie le nom de classe."
+    println "⚠ No annotations found. Check the class name."
     return
 }
 
@@ -226,50 +226,50 @@ annotations.eachWithIndex { annotation, idx ->
     ImageIO.write(mask, "PNG", maskFile)
 
     count++
-    if (count % 10 == 0) println "  ${count}/${annotations.size()} exportés..."
+    if (count % 10 == 0) println "  ${count}/${annotations.size()} exported..."
 }
 
-println "✓ Export terminé : ${count} paires image/masque dans ${outputDir}"
+println "✓ Export complete: ${count} image/mask pairs in ${outputDir}"
 ```
 
-Résultat attendu dans la console QuPath :
+Expected QuPath console output:
 ```
-INFO: → 102 annotations 'Glomerulus' trouvées
-INFO:   10/102 exportés...
+INFO: → 102 'Glomerulus' annotations found
+INFO:   10/102 exported...
 [...]
-INFO: ✓ Export terminé : 102 paires image/masque dans /Users/antonino/QuPath/training_data
+INFO: ✓ Export complete: 102 image/mask pairs in /Users/antonino/QuPath/training_data
 ```
 
-Vérification dans le Terminal :
+Terminal verification:
 ```bash
 ls /Users/antonino/QuPath/training_data/images/ | wc -l   # → 102
 ls /Users/antonino/QuPath/training_data/masks/  | wc -l   # → 102
 ```
 
-Structure générée :
+Generated structure:
 ```
 /Users/antonino/QuPath/training_data/
     ├── images/
-    │   ├── glom_000.png  (taille min observée : 248×225 px)
-    │   └── ... (102 fichiers)
+    │   ├── glom_000.png  (minimum observed size: 248×225 px)
+    │   └── ... (102 files)
     └── masks/
         ├── glom_000.png
-        └── ... (102 fichiers)
+        └── ... (102 files)
 ```
 
 ---
 
-## PARTIE 3 — Entraînement StarDist custom
+## PART 3 — Custom StarDist Training
 
-### 3.1 Script d'entraînement
+### 3.1 Training script
 
-Créer le dossier et le script :
+Create the folder and script:
 ```bash
 mkdir -p /Users/antonino/QuPath/training
 nano /Users/antonino/QuPath/training/train_stardist_glom.py
 ```
 
-Contenu complet du script :
+Full script content:
 
 ```python
 import numpy as np
@@ -281,14 +281,14 @@ from stardist import fill_label_holes
 from stardist.models import Config2D, StarDist2D
 import tensorflow as tf
 
-print(f"TensorFlow : {tf.__version__}")
-print(f"GPU disponible : {tf.config.list_physical_devices('GPU')}")
+print(f"TensorFlow: {tf.__version__}")
+print(f"GPU available: {tf.config.list_physical_devices('GPU')}")
 
-# ── PARAMÈTRES ────────────────────────────────────────────────
+# ── PARAMETERS ────────────────────────────────────────────────
 DATA_DIR   = "/Users/antonino/QuPath/training_data"
 MODEL_DIR  = "/Users/antonino/QuPath/models"
 MODEL_NAME = "glomerulus_carstairs"
-PATCH_SIZE = (128, 128)   # Réduit à 128 car certains patches font 248×225 minimum
+PATCH_SIZE = (128, 128)   # Reduced to 128 — some patches are as small as 248×225 px
 N_RAYS     = 32
 EPOCHS     = 100
 # ─────────────────────────────────────────────────────────────
@@ -296,10 +296,10 @@ EPOCHS     = 100
 img_paths  = sorted(glob(os.path.join(DATA_DIR, "images", "*.png")))
 mask_paths = sorted(glob(os.path.join(DATA_DIR, "masks",  "*.png")))
 
-print(f"\n→ {len(img_paths)} images trouvées")
-print(f"→ {len(mask_paths)} masques trouvés")
+print(f"\n→ {len(img_paths)} images found")
+print(f"→ {len(mask_paths)} masks found")
 
-assert len(img_paths) == len(mask_paths), "Nombre d'images et masques différent !"
+assert len(img_paths) == len(mask_paths), "Image and mask counts differ!"
 
 images = []
 masks  = []
@@ -307,7 +307,7 @@ masks  = []
 for ip, mp in zip(img_paths, mask_paths):
     img = sk_imread(ip)
     if img.ndim == 3:
-        img = img[:, :, 1].astype(np.float32)   # Canal vert (optimal pour Carstairs)
+        img = img[:, :, 1].astype(np.float32)   # Green channel (optimal for Carstairs)
     else:
         img = img.astype(np.float32)
 
@@ -323,9 +323,9 @@ for ip, mp in zip(img_paths, mask_paths):
 sizes = [img.shape for img in images]
 min_h = min(s[0] for s in sizes)
 min_w = min(s[1] for s in sizes)
-print(f"→ Images chargées. Taille min : {min_h}×{min_w} | max : {max(s[0] for s in sizes)}×{max(s[1] for s in sizes)}")
+print(f"→ Images loaded. Min size: {min_h}×{min_w} | Max: {max(s[0] for s in sizes)}×{max(s[1] for s in sizes)}")
 
-# Filtre les images trop petites pour le patch_size
+# Filter images too small for patch_size
 images_ok = []
 masks_ok  = []
 skipped   = 0
@@ -337,9 +337,9 @@ for img, msk in zip(images, masks):
         skipped += 1
 
 if skipped > 0:
-    print(f"⚠ {skipped} images ignorées car trop petites pour PATCH_SIZE {PATCH_SIZE}")
+    print(f"⚠ {skipped} images skipped (too small for PATCH_SIZE {PATCH_SIZE})")
 
-print(f"→ {len(images_ok)} images retenues pour l'entraînement")
+print(f"→ {len(images_ok)} images retained for training")
 
 n_val   = max(1, int(len(images_ok) * 0.2))
 n_train = len(images_ok) - n_val
@@ -349,7 +349,7 @@ Y_train = masks_ok[:n_train]
 X_val   = images_ok[n_train:]
 Y_val   = masks_ok[n_train:]
 
-print(f"→ Train : {n_train} | Validation : {n_val}")
+print(f"→ Train: {n_train} | Validation: {n_val}")
 
 X_train = [normalize(x, 1, 99) for x in X_train]
 X_val   = [normalize(x, 1, 99) for x in X_val]
@@ -368,8 +368,8 @@ conf = Config2D(
 os.makedirs(MODEL_DIR, exist_ok=True)
 model = StarDist2D(conf, name=MODEL_NAME, basedir=MODEL_DIR)
 
-print(f"\n→ Début de l'entraînement ({EPOCHS} epochs)...")
-print(f"→ Modèle sauvegardé dans : {MODEL_DIR}/{MODEL_NAME}")
+print(f"\n→ Starting training ({EPOCHS} epochs)...")
+print(f"→ Model will be saved to: {MODEL_DIR}/{MODEL_NAME}")
 print("─" * 50)
 
 model.train(
@@ -378,39 +378,39 @@ model.train(
     augmenter       = None,
 )
 
-print("\n→ Optimisation du seuil de détection...")
+print("\n→ Optimizing detection thresholds...")
 model.optimize_thresholds(X_val, Y_val)
 
-print(f"\n✓ Entraînement terminé.")
-print(f"✓ Modèle disponible dans : {MODEL_DIR}/{MODEL_NAME}")
-print(f"✓ Pour QuPath : utilise le dossier complet (pas un fichier .pb)")
+print(f"\n✓ Training complete.")
+print(f"✓ Model available at: {MODEL_DIR}/{MODEL_NAME}")
+print(f"✓ For QuPath: use the full folder (not a .pb file)")
 ```
 
-### 3.2 Lancement
+### 3.2 Launch
 
 ```bash
 cd /Users/antonino/QuPath/training
 python train_stardist_glom.py
 ```
 
-Résultat attendu au démarrage :
+Expected output at startup:
 ```
-TensorFlow : 2.16.2
-GPU disponible : [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')]
-→ 102 images trouvées
-→ 102 masques trouvés
-→ Images chargées. Taille min : 248×225 | max : 426×453
-→ 102 images retenues pour l'entraînement
-→ Train : 82 | Validation : 20
+TensorFlow: 2.16.2
+GPU available: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')]
+→ 102 images found
+→ 102 masks found
+→ Images loaded. Min size: 248×225 | Max: 426×453
+→ 102 images retained for training
+→ Train: 82 | Validation: 20
 Metal device set to: Apple M1 Max
 Epoch 1/100
 100/100 ━━━━━━━━━━━━━━━━━━━━ 27s 160ms/step - loss: 8.89 ...
 ```
 
-> Durée estimée : ~45 minutes sur M1 Max (27s/epoch × 100 epochs)  
-> Ne pas fermer le Terminal pendant l'entraînement.
+> Estimated duration: ~45 minutes on M1 Max (27s/epoch × 100 epochs)  
+> Do not close the Terminal during training.
 
-### 3.3 Résultat attendu
+### 3.3 Expected output
 
 ```
 /Users/antonino/QuPath/models/glomerulus_carstairs/
@@ -421,24 +421,24 @@ Epoch 1/100
 
 ---
 
-## PARTIE 4 — Détection dans QuPath
+## PART 4 — Detection in QuPath
 
-*(Section à compléter après fin de l'entraînement)*
-
----
-
-## PARTIE 5 — Classification Sain/Pathologique
-
-*(Section à compléter)*
+*(To be completed after training)*
 
 ---
 
-## Notes techniques
+## PART 5 — Healthy/Pathological Classification
 
-- Diamètre moyen d'un glomérule : **204 pixels**
-- Taille min des patches exportés : **248×225 px** → PATCH_SIZE réduit à 128×128
-- Calibration estimée : **1 µm/pixel**
-- Coloration : **Carstairs** (multi-chromatique — la déconvolution standard ne s'applique pas)
-- Canal optimal pour prétraitement : **Canal vert (index 1)**
-- Glomérules : structures star-convexes ~200 µm, mauve dense sur fond rose
-- GPU Metal confirmé actif pendant l'entraînement : Apple M1 Max, 32 GB
+*(To be completed)*
+
+---
+
+## Technical Notes
+
+- Average glomerulus diameter: **204 pixels**
+- Minimum exported patch size: **248×225 px** → PATCH_SIZE reduced to 128×128
+- Estimated calibration: **1 µm/pixel**
+- Staining: **Carstairs** (multi-chromatic — standard color deconvolution does not apply)
+- Optimal preprocessing channel: **Green channel (index 1)**
+- Glomeruli: star-convex structures ~200 µm, dense mauve on pink background
+- GPU Metal confirmed active during training: Apple M1 Max, 32 GB
