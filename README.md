@@ -23,18 +23,22 @@ Semi-automated pipeline for:
 | Cellpose | Designed for individual cells — not suited for ~200 µm complex structures |
 | Random Forest Pixel Classifier alone | Performance ceiling insufficient for a robust long-term pipeline |
 | Color deconvolution (Visual Stain Editor) | Not applicable to Carstairs staining (designed for H&E and H-DAB only) |
-| StarDist inference via ONNX in QuPath 0.7.0 | OpenCV 4.11 cannot resolve dynamic tensor shapes from ONNX export; DJL backend also failed to load the model |
-| Direct full-image prediction (no tiling) | OOM on GPU: image of 469M pixels exceeds Metal allocator capacity |
-| n_tiles StarDist native with large tiles (2030×2066px) | Model trained on 128px patches could not generalize to tiles 16× larger |
-| Manual tiling with 512px tiles + centroid NMS | Too many false positives — model detected intra-glomerular substructures |
+| StarDist inference via ONNX in QuPath 0.7.0 | OpenCV 4.11 cannot handle dynamic tensor shapes; DJL backend also failed |
+| Direct full-image prediction (no tiling) | OOM on GPU: 469M pixel image exceeds Metal allocator capacity |
+| n_tiles StarDist native with PATCH_SIZE=128 | Model trained on 128px patches could not generalize — detected intra-glomerular substructures |
+| Absolute intensity threshold for Bowman's capsule | Images have different global brightness — a fixed threshold fails across images |
+| Relative percentile threshold (p65) | Carstairs staining has very high green channel values — p65 = 208/255, filters everything |
+| Circularity filter | StarDist outputs are intrinsically star-convex — all pass circularity filter |
 
 ---
 
-## Root Cause of Initial Detection Failures
+## Root Causes and Fixes
 
-Training with `PATCH_SIZE = (128, 128)` while glomeruli are ~200 px in diameter caused the model to learn on **glomerulus fragments** rather than whole structures. This led to massive over-detection of internal sub-structures during inference.
-
-**Fix:** Re-export patches with `padding = 150` (yielding patches of 420–598 px), retrain with `PATCH_SIZE = (320, 320)`.
+| Problem | Root Cause | Fix Applied |
+|---|---|---|
+| 41 detections on training image | PATCH_SIZE=128 < glomerulus diameter (200px) — model learned fragments | Re-export with padding=150, retrain with PATCH_SIZE=320 |
+| 1145 detections on LysM_01 | Model detects inflammatory infiltrates (similar round dense morphology) | Bowman's capsule contrast ratio filter (ring/interior intensity ratio) |
+| Contrast filter not adaptive | Absolute intensity threshold fails across images with different staining | Relative contrast ratio: ring_mean / interior_mean > threshold |
 
 ---
 
@@ -51,13 +55,14 @@ Training with `PATCH_SIZE = (128, 128)` while glomeruli are ~200 px in diameter 
   PATCH_SIZE=(320,320), EPOCHS=150
   (Python, TensorFlow Metal, M1 Max GPU, ~65 min)
             ↓
-  Model "glomerulus_carstairs"
-            ↓
-  Inference via Python (n_tiles, GeoJSON export)
+  Python inference with tiling (n_tiles ~33×58)
+  + Post-processing filters:
+    - Size filter: 10,000–80,000 px²
+    - Bowman contrast ratio: ring/interior > threshold
   (detect_glomeruli.py)
             ↓
-  Import GeoJSON into QuPath
-  (File → Import → Objects from GeoJSON)
+  GeoJSON export → QuPath import
+  (Groovy script: import_geojson.groovy)
             ↓
   Healthy/Pathological classification
   (QuPath Object Classifier)
@@ -92,25 +97,11 @@ brew install miniforge
 conda init bash
 ```
 
-Expected output:
-```
-modified      /Users/<username>/.bash_profile
-==> For changes to take effect, close and re-open your current shell. <==
-```
-
 ⚠️ **Fully close Terminal (Cmd+Q) and reopen it.**
 
 ```bash
-conda --version
+conda --version   # → 26.1.1
 ```
-
-Expected output:
-```
-conda 26.1.1
-```
-
-> **Note:** If your default shell is zsh, replace `conda init bash` with `conda init zsh`.
-> To check your shell: `echo $SHELL`
 
 ### 1.4 Dedicated Python environment
 
@@ -122,30 +113,25 @@ conda create -n stardist-glom python=3.10 -y
 
 ```bash
 conda activate stardist-glom
-python --version
+python --version   # → Python 3.10.20
 ```
 
-Expected output:
-```
-(stardist-glom) user$ python --version
-Python 3.10.20
-```
-
-> The `(stardist-glom)` prefix in the prompt confirms the environment is active.
-
-### 1.5 StarDist + TensorFlow Metal installation
+### 1.5 Python dependencies
 
 ```bash
 pip install tensorflow-macos tensorflow-metal
 pip install stardist
 pip install numpy matplotlib tifffile scikit-image csbdeep jupyter
 pip install gputools
-pip install "numpy<2"   # Required — gputools forces numpy 2.x which breaks TensorFlow
-pip install tf2onnx onnx  # For potential future ONNX export (optional)
+pip install "numpy<2"        # CRITICAL: gputools upgrades numpy to 2.x which breaks TensorFlow
+pip install tf2onnx onnx     # Optional: for ONNX export attempts
+pip install shapely
+pip install opencv-python-headless
+pip install "numpy<2"        # Re-run after opencv install — it may re-upgrade numpy
 ```
 
-> ⚠️ Order matters: install `gputools` THEN downgrade numpy.
-> The `reikna` conflict warning is harmless for this pipeline.
+> ⚠️ Always verify numpy version after any new pip install:
+> `python -c "import numpy; print(numpy.__version__)"` must show `1.26.x`
 
 Verification:
 ```bash
@@ -166,25 +152,23 @@ StarDist OK
 ### 2.1 Project creation
 
 - Launch QuPath → `File → New Project`
-- Name the project `GlomAndreMarc`
+- Name: `GlomAndreMarc`
 - Location: `/Users/antonino/Desktop/GlomAndreMarc`
-- Import images from `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` through `LysM_11.jpg`)
+- Import images from `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` → `LysM_11.jpg`)
 
 ### 2.2 Manual annotations (ground truth)
 
-- Open `LysM_01.jpg` in QuPath
-- Using the Brush tool (**B**), annotate 102 glomeruli as class `Glomerulus`
-- Additional tissue classes annotated: `Cortex Tissue` (26), `Medulla Tissue` (16), `White` (9)
+- Open `LysM_01.jpg`
+- Brush tool (**B**) → annotate 102 glomeruli as class `Glomerulus`
+- Additional classes: `Cortex Tissue` (26), `Medulla Tissue` (16), `White` (9)
 - Total: 153 annotations
 
-> These 102 annotations form the training dataset for the custom StarDist model.  
-> **Do not delete** — they will also be used for Healthy/Pathological classification.
+> These 102 annotations = training dataset for custom StarDist model.
+> **Do not delete** — also used for Healthy/Pathological classification.
 
 ### 2.3 Training patch export
 
-In QuPath: **`Automate`** → **`Project scripts`** → **`export_training_patches.groovy`**
-
-Save script as `export_training_patches.groovy` via **`File → Save As`** in the Script Editor.
+**`Automate`** → **`Project scripts`** → `export_training_patches.groovy`
 
 ```groovy
 import qupath.lib.regions.RegionRequest
@@ -196,7 +180,7 @@ import java.awt.geom.AffineTransform
 
 def outputDir  = "/Users/antonino/QuPath/training_data"
 def className  = "Glomerulus"
-def padding    = 150          // 150px margin — ensures full glomerulus captured
+def padding    = 150          // 150px margin — ensures full glomerulus + capsule captured
 def downsample = 1.0
 
 new File("${outputDir}/images").mkdirs()
@@ -211,14 +195,9 @@ def annotations = QP.getAnnotationObjects().findAll {
 }
 
 println "→ ${annotations.size()} '${className}' annotations found"
-
-if (annotations.isEmpty()) {
-    println "⚠ No annotations found. Check the class name."
-    return
-}
+if (annotations.isEmpty()) { println "⚠ No annotations found."; return }
 
 int count = 0
-
 annotations.eachWithIndex { annotation, idx ->
     def roi = annotation.getROI()
     int x = Math.max(0, (int)(roi.getBoundsX() - padding))
@@ -228,39 +207,24 @@ annotations.eachWithIndex { annotation, idx ->
 
     def region   = RegionRequest.createInstance(server.getPath(), downsample, x, y, w, h)
     def imgPatch = server.readRegion(region)
-    def imgFile  = new File("${outputDir}/images/glom_${String.format('%03d', idx)}.png")
-    ImageIO.write(imgPatch, "PNG", imgFile)
+    ImageIO.write(imgPatch, "PNG", new File("${outputDir}/images/glom_${String.format('%03d', idx)}.png"))
 
     def mask = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY)
     def g2d  = mask.createGraphics()
-    g2d.setColor(Color.BLACK)
-    g2d.fillRect(0, 0, w, h)
+    g2d.setColor(Color.BLACK); g2d.fillRect(0, 0, w, h)
     g2d.setColor(Color.WHITE)
-    def transform        = new AffineTransform()
-    transform.translate(-x as double, -y as double)
-    def transformedShape = transform.createTransformedShape(roi.getShape())
-    g2d.fill(transformedShape)
+    def t = new AffineTransform(); t.translate(-x as double, -y as double)
+    g2d.fill(t.createTransformedShape(roi.getShape()))
     g2d.dispose()
-
-    def maskFile = new File("${outputDir}/masks/glom_${String.format('%03d', idx)}.png")
-    ImageIO.write(mask, "PNG", maskFile)
+    ImageIO.write(mask, "PNG", new File("${outputDir}/masks/glom_${String.format('%03d', idx)}.png"))
 
     count++
     if (count % 10 == 0) println "  ${count}/${annotations.size()} exported..."
 }
-
-println "✓ Export complete: ${count} image/mask pairs in ${outputDir}"
+println "✓ Export complete: ${count} pairs in ${outputDir}"
 ```
 
-Expected console output:
-```
-INFO: → 102 'Glomerulus' annotations found
-INFO:   10/102 exported...
-[...]
-INFO: ✓ Export complete: 102 image/mask pairs in /Users/antonino/QuPath/training_data
-```
-
-Patch size after export: **min 420×397 px, max 598×625 px**
+Expected result: **102 pairs**, patch size min 420×397 px, max 598×625 px
 
 ---
 
@@ -289,108 +253,62 @@ import tensorflow as tf
 print(f"TensorFlow: {tf.__version__}")
 print(f"GPU available: {tf.config.list_physical_devices('GPU')}")
 
-# ── PARAMETERS ────────────────────────────────────────────────
 DATA_DIR   = "/Users/antonino/QuPath/training_data"
 MODEL_DIR  = "/Users/antonino/QuPath/models"
 MODEL_NAME = "glomerulus_carstairs"
-PATCH_SIZE = (320, 320)   # Larger than glomeruli (~200px diameter)
+PATCH_SIZE = (320, 320)
 N_RAYS     = 32
 EPOCHS     = 150
-# ─────────────────────────────────────────────────────────────
 
 img_paths  = sorted(glob(os.path.join(DATA_DIR, "images", "*.png")))
 mask_paths = sorted(glob(os.path.join(DATA_DIR, "masks",  "*.png")))
 
-print(f"\n→ {len(img_paths)} images found")
-print(f"→ {len(mask_paths)} masks found")
+assert len(img_paths) == len(mask_paths)
+print(f"→ {len(img_paths)} images found")
 
-assert len(img_paths) == len(mask_paths), "Image and mask counts differ!"
-
-images = []
-masks  = []
-
+images, masks = [], []
 for ip, mp in zip(img_paths, mask_paths):
     img = sk_imread(ip)
-    if img.ndim == 3:
-        img = img[:, :, 1].astype(np.float32)   # Green channel (optimal for Carstairs)
-    else:
-        img = img.astype(np.float32)
-
+    img = img[:, :, 1].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
     msk = sk_imread(mp)
-    if msk.ndim == 3:
-        msk = msk[:, :, 0]
+    msk = msk[:, :, 0] if msk.ndim == 3 else msk
     msk = (msk > 128).astype(np.uint16)
     msk = fill_label_holes(msk)
-
     images.append(img)
     masks.append(msk)
 
 sizes = [img.shape for img in images]
-min_h = min(s[0] for s in sizes)
-min_w = min(s[1] for s in sizes)
-print(f"→ Images loaded. Min: {min_h}×{min_w} | Max: {max(s[0] for s in sizes)}×{max(s[1] for s in sizes)}")
+print(f"→ Min: {min(s[0] for s in sizes)}×{min(s[1] for s in sizes)} | Max: {max(s[0] for s in sizes)}×{max(s[1] for s in sizes)}")
 
-# Resize patches smaller than PATCH_SIZE
-images_resized = []
-masks_resized  = []
-resized_count  = 0
-
+images_r, masks_r = [], []
 for img, msk in zip(images, masks):
     if img.shape[0] < PATCH_SIZE[0] or img.shape[1] < PATCH_SIZE[1]:
         img = sk_resize(img, PATCH_SIZE, preserve_range=True).astype(np.float32)
         msk = sk_resize(msk, PATCH_SIZE, preserve_range=True, order=0).astype(np.uint16)
-        resized_count += 1
-    images_resized.append(img)
-    masks_resized.append(msk)
+    images_r.append(img); masks_r.append(msk)
 
-if resized_count > 0:
-    print(f"→ {resized_count} images resized to minimum {PATCH_SIZE}")
-
-images = images_resized
-masks  = masks_resized
-
-n_val   = max(1, int(len(images) * 0.2))
-n_train = len(images) - n_val
-
-X_train = images[:n_train]
-Y_train = masks[:n_train]
-X_val   = images[n_train:]
-Y_val   = masks[n_train:]
-
+n_val   = max(1, int(len(images_r) * 0.2))
+n_train = len(images_r) - n_val
+X_train = [normalize(x, 1, 99) for x in images_r[:n_train]]
+Y_train = masks_r[:n_train]
+X_val   = [normalize(x, 1, 99) for x in images_r[n_train:]]
+Y_val   = masks_r[n_train:]
 print(f"→ Train: {n_train} | Validation: {n_val}")
 
-X_train = [normalize(x, 1, 99) for x in X_train]
-X_val   = [normalize(x, 1, 99) for x in X_val]
-
 conf = Config2D(
-    n_rays                = N_RAYS,
-    grid                  = (2, 2),
-    n_channel_in          = 1,
-    train_patch_size      = PATCH_SIZE,
-    train_epochs          = EPOCHS,
-    train_steps_per_epoch = 100,
-    train_batch_size      = 2,   # Reduced — larger patches require more VRAM
-    use_gpu               = True,
+    n_rays=N_RAYS, grid=(2,2), n_channel_in=1,
+    train_patch_size=PATCH_SIZE, train_epochs=EPOCHS,
+    train_steps_per_epoch=100, train_batch_size=2, use_gpu=True,
 )
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 model = StarDist2D(conf, name=MODEL_NAME, basedir=MODEL_DIR)
+print(f"→ Training {EPOCHS} epochs...")
 
-print(f"\n→ Starting training ({EPOCHS} epochs, patch={PATCH_SIZE})...")
-print(f"→ Model will be saved to: {MODEL_DIR}/{MODEL_NAME}")
-print("─" * 50)
-
-model.train(
-    X_train, Y_train,
-    validation_data = (X_val, Y_val),
-    augmenter       = None,
-)
-
-print("\n→ Optimizing detection thresholds...")
+model.train(X_train, Y_train, validation_data=(X_val, Y_val), augmenter=None)
 model.optimize_thresholds(X_val, Y_val)
 
-print(f"\n✓ Training complete.")
-print(f"✓ Model available at: {MODEL_DIR}/{MODEL_NAME}")
+print(f"✓ Training complete: {MODEL_DIR}/{MODEL_NAME}")
 ```
 
 ### 3.2 Launch
@@ -400,26 +318,15 @@ cd /Users/antonino/QuPath/training
 python train_stardist_glom.py
 ```
 
-Expected output at startup:
-```
-TensorFlow: 2.16.2
-GPU available: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')]
-→ 102 images found | Min: 420×397 | Max: 598×625
-→ Train: 82 | Validation: 20
-Metal device set to: Apple M1 Max, 32 GB
-Epoch 1/150
-100/100 ━━━━━━━━━━━━━━━━━━━━ 33s ...
-```
+Expected: ~65 min, final optimized thresholds `prob_thresh=0.793594, nms_thresh=0.3`
 
-> Estimated duration: ~65 minutes on M1 Max
-
-### 3.3 Expected model output
+### 3.3 Output
 
 ```
 /Users/antonino/QuPath/models/glomerulus_carstairs/
     ├── config.json
-    ├── thresholds.json
-    ├── weights_best.h5      ← used for inference
+    ├── thresholds.json      ← prob_thresh=0.793594, nms_thresh=0.3
+    ├── weights_best.h5
     ├── weights_last.h5
     └── logs/
 ```
@@ -428,8 +335,10 @@ Epoch 1/150
 
 ## PART 4 — Inference and GeoJSON Export
 
-> **Why Python inference instead of QuPath native?**  
-> QuPath 0.7.0 uses OpenCV 4.11 + DJL to load models. OpenCV 4.11 cannot handle dynamic tensor shapes in ONNX format, and DJL could not load the StarDist model either. The robust solution is to run inference in Python (where StarDist runs natively with Metal GPU) and export results as GeoJSON, which QuPath imports natively.
+> **Why Python inference instead of QuPath native?**
+> QuPath 0.7.0 uses OpenCV 4.11 + DJL. OpenCV 4.11 rejects ONNX models with dynamic shapes.
+> DJL could not load the StarDist .h5 model either.
+> Solution: run inference in Python with Metal GPU, export as GeoJSON, import into QuPath natively.
 
 ### 4.1 Detection script
 
@@ -438,27 +347,195 @@ nano /Users/antonino/QuPath/training/detect_glomeruli.py
 ```
 
 ```python
-# (to be completed after training)
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import json
+import numpy as np
+from glob import glob
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+from shapely.geometry import Polygon
+from shapely.affinity import scale
+from csbdeep.utils import normalize
+from stardist.models import StarDist2D
+import cv2
+
+# ── PARAMETERS ────────────────────────────────────────────────
+IMAGE_DIR          = "/Users/antonino/Desktop/Export pics"
+MODEL_DIR          = "/Users/antonino/QuPath/models"
+MODEL_NAME         = "glomerulus_carstairs"
+OUTPUT_DIR         = "/Users/antonino/Desktop/GlomAndreMarc/detections"
+PROB_THRESH        = 0.793
+NMS_THRESH         = 0.3
+MIN_AREA_PX        = 10000
+MAX_AREA_PX        = 80000
+BOWMAN_RING_FACTOR = 1.3
+MIN_CONTRAST_RATIO = 1.10   # ring_mean / interior_mean — calibrated on LysM_01
+# Contrast ratio distribution on LysM_01: min=0.775 mean=1.029 max=1.317
+# True glomeruli expected at ratio > 1.10
+# ─────────────────────────────────────────────────────────────
+
+def coords_to_polygon(coords):
+    y_arr, x_arr = coords[0], coords[1]
+    pts = [[float(x_arr[j]), float(y_arr[j])] for j in range(len(y_arr))]
+    pts.append(pts[0])
+    return pts
+
+def contrast_ratio(img_green, poly, factor, img_shape):
+    H, W  = img_shape
+    outer = scale(poly, xfact=factor, yfact=factor)
+    mask_i = np.zeros((H, W), dtype=np.uint8)
+    mask_o = np.zeros((H, W), dtype=np.uint8)
+
+    def to_cv2(p):
+        return np.array([[int(x), int(y)] for x, y in p.exterior.coords], dtype=np.int32)
+
+    try:
+        cv2.fillPoly(mask_i, [to_cv2(poly)],  1)
+        cv2.fillPoly(mask_o, [to_cv2(outer)], 1)
+    except Exception:
+        return 0
+
+    interior = mask_i > 0
+    ring     = (mask_o - mask_i) > 0
+
+    if interior.sum() == 0 or ring.sum() == 0:
+        return 0
+
+    interior_mean = float(img_green[interior].mean())
+    if interior_mean == 0:
+        return 0
+
+    return float(img_green[ring].mean()) / interior_mean
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+model = StarDist2D(None, name=MODEL_NAME, basedir=MODEL_DIR)
+
+image_paths = sorted(glob(os.path.join(IMAGE_DIR, "LysM_*.jpg")))
+print(f"→ {len(image_paths)} images found\n")
+
+for image_path in image_paths:
+    image_name  = os.path.splitext(os.path.basename(image_path))[0]
+    output_json = os.path.join(OUTPUT_DIR, f"{image_name}_detections.geojson")
+    print(f"→ Processing: {image_name}")
+
+    img       = np.array(Image.open(image_path))
+    H, W      = img.shape[:2]
+    img_green = img[:, :, 1].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
+    img_norm  = normalize(img_green, 1, 99)
+
+    n_ty = max(1, int(np.ceil(H / 500)))
+    n_tx = max(1, int(np.ceil(W / 500)))
+
+    labels, details = model.predict_instances(
+        img_norm, prob_thresh=PROB_THRESH, nms_thresh=NMS_THRESH, n_tiles=(n_ty, n_tx)
+    )
+
+    coords_list = details['coord']
+    print(f"   {len(coords_list)} raw detections")
+
+    features = []
+    skip_area = skip_contrast = 0
+    ratios = []
+
+    for coords in coords_list:
+        pts  = coords_to_polygon(coords)
+        poly = Polygon(pts)
+        area = poly.area
+
+        if area < MIN_AREA_PX or area > MAX_AREA_PX:
+            skip_area += 1
+            continue
+
+        ratio = contrast_ratio(img_green, poly, BOWMAN_RING_FACTOR, (H, W))
+        ratios.append(ratio)
+
+        if ratio < MIN_CONTRAST_RATIO:
+            skip_contrast += 1
+            continue
+
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [pts]},
+            "properties": {
+                "objectType": "detection",
+                "classification": {"name": "Glomerulus", "color": [200, 0, 0]},
+                "name":           f"Glomerulus_{len(features)+1:04d}",
+                "area_px":        round(area, 1),
+                "contrast_ratio": round(ratio, 3),
+            }
+        })
+
+    if ratios:
+        print(f"   Contrast: min={min(ratios):.3f} mean={np.mean(ratios):.3f} max={max(ratios):.3f}")
+    print(f"   Filtered: {skip_area} by area | {skip_contrast} by contrast")
+    print(f"   {len(features)} glomeruli retained")
+
+    with open(output_json, 'w') as f:
+        json.dump({"type": "FeatureCollection", "features": features}, f, indent=2)
+    print(f"   ✓ Saved: {output_json}\n")
+
+print("✓ All images processed")
+print(f"✓ GeoJSON files in: {OUTPUT_DIR}")
 ```
 
-*(Section to be completed after training validation)*
+### 4.2 Launch
+
+```bash
+cd /Users/antonino/QuPath/training
+python detect_glomeruli.py
+```
+
+### 4.3 Import into QuPath
+
+For each image, in QuPath Script Editor:
+
+```groovy
+import qupath.lib.io.GsonTools
+import java.nio.file.Files
+import java.nio.file.Paths
+import com.google.gson.JsonParser
+
+def geojsonPath = "/Users/antonino/Desktop/GlomAndreMarc/detections/LysM_01_detections.geojson"
+def imageData   = getCurrentImageData()
+
+def json        = new String(Files.readAllBytes(Paths.get(geojsonPath)))
+def root        = JsonParser.parseString(json).getAsJsonObject()
+def featuresArr = root.getAsJsonArray("features")
+
+println "→ ${featuresArr.size()} features in GeoJSON"
+
+def objects = GsonTools.getInstance().fromJson(
+    featuresArr,
+    new com.google.gson.reflect.TypeToken<List<qupath.lib.objects.PathObject>>(){}.getType()
+)
+
+println "→ ${objects.size()} objects parsed"
+imageData.getHierarchy().addObjects(objects)
+fireHierarchyUpdate()
+println "✓ Objects imported"
+```
 
 ---
 
-## PART 5 — Import into QuPath and Classification
+## PART 5 — Healthy/Pathological Classification
 
-*(To be completed)*
+*(To be completed after detection validation)*
 
 ---
 
 ## Technical Notes
 
-- Average glomerulus diameter: **~200 pixels** (measured: 204 px)
+- Average glomerulus diameter: **~200 px** (measured: 204 px)
 - Training patch size (padding=150): **min 420×397 px, max 598×625 px**
-- Training PATCH_SIZE: **320×320** (larger than glomerulus diameter)
-- Estimated calibration: **1 µm/pixel** (no metadata available)
-- Staining: **Carstairs** (multi-chromatic — standard color deconvolution does not apply)
-- Optimal preprocessing channel: **Green channel (index 1)**
-- Glomeruli morphology: star-convex structures ~200 µm, dense mauve on pink background
-- GPU Metal confirmed active: Apple M1 Max, 32 GB unified memory
-- Images: 11 files, ~469M pixels each (28928×16240 or 28800×16240)
+- Training PATCH_SIZE: **320×320** (must exceed glomerulus diameter)
+- Optimized detection thresholds: **prob_thresh=0.793594, nms_thresh=0.3**
+- Calibration: **~1 µm/pixel** (estimated — no JPEG metadata)
+- Staining: **Carstairs** — color deconvolution not applicable
+- Optimal channel: **Green (index 1)** — best contrast for Carstairs
+- Glomeruli: star-convex, ~200 µm, dense mauve interior + bright Bowman's capsule ring
+- Contrast ratio (ring/interior green intensity): glomeruli > 1.10, infiltrates ≈ 1.00–1.05
+- GPU: Apple M1 Max Metal, 32 GB unified memory
+- Images: 11 files, ~469M pixels (28928×16240 or 28800×16240 px)
+- numpy must stay at **1.26.4** — any pip install may silently upgrade it
