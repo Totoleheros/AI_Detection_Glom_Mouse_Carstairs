@@ -1,5 +1,5 @@
 # Glomerulus Detection and Classification Pipeline
-**QuPath 0.7.0 + Custom StarDist + Apple Silicon (M1 Max)**  
+**QuPath 0.7.0 + nnU-Net v2 + Apple Silicon (M1 Max)**  
 Staining: Carstairs | Images: Brightfield JPEG (~28928 × 16240 px)
 
 ---
@@ -14,55 +14,57 @@ Semi-automated pipeline for:
 
 ---
 
-## Abandoned Approaches (and Why)
+## Why nnU-Net and not StarDist
+
+StarDist was the initial approach but was abandoned after thorough testing. The fundamental issue is architectural: StarDist is a **shape detector** (star-convex objects), not a **semantic segmenter**. It cannot distinguish glomeruli from inflammatory infiltrates or transverse tubular sections, all of which share a similar round, dense morphology in Carstairs staining. All post-hoc filters tested (size, circularity, Bowman's capsule contrast ratio) failed to robustly discriminate these structures across images with different staining intensities.
+
+nnU-Net is a **semantic segmentation** framework based on U-Net architecture. It learns what a glomerulus looks like in context, not just its shape. It natively handles background learning from unannotated regions, is self-configuring, and has published results on renal glomeruli segmentation.
+
+---
+
+## Abandoned Approaches (full history)
 
 | Approach | Reason for Abandonment |
 |---|---|
-| StarDist with pre-trained model `he_heavy_augment.pb` | Detects individual nuclei, not whole glomeruli |
+| StarDist pre-trained `he_heavy_augment.pb` | Detects individual nuclei, not whole glomeruli |
 | BioImage.IO Model Zoo | No glomerulus/kidney model available |
-| Cellpose | Designed for individual cells — not suited for ~200 µm complex structures |
-| Random Forest Pixel Classifier alone | Performance ceiling insufficient for a robust long-term pipeline |
-| Color deconvolution (Visual Stain Editor) | Not applicable to Carstairs staining (designed for H&E and H-DAB only) |
-| StarDist inference via ONNX in QuPath 0.7.0 | OpenCV 4.11 cannot handle dynamic tensor shapes; DJL backend also failed |
-| Direct full-image prediction (no tiling) | OOM on GPU: 469M pixel image exceeds Metal allocator capacity |
-| n_tiles StarDist native with PATCH_SIZE=128 | Model trained on 128px patches could not generalize — detected intra-glomerular substructures |
-| Absolute intensity threshold for Bowman's capsule | Images have different global brightness — a fixed threshold fails across images |
-| Relative percentile threshold (p65) | Carstairs staining has very high green channel values — p65 = 208/255, filters everything |
-| Circularity filter | StarDist outputs are intrinsically star-convex — all pass circularity filter |
+| Cellpose | Designed for individual cells — not suited for ~200 µm structures |
+| Random Forest Pixel Classifier alone | Insufficient performance ceiling for a robust pipeline |
+| Color deconvolution (Visual Stain Editor) | Not applicable to Carstairs (designed for H&E and H-DAB only) |
+| StarDist ONNX inference in QuPath 0.7.0 | OpenCV 4.11 rejects dynamic tensor shapes; DJL backend also failed |
+| Direct full-image StarDist prediction | OOM on GPU: 469M pixel image exceeds Metal allocator capacity |
+| StarDist with PATCH_SIZE=128 | Model trained on fragments — detected intra-glomerular substructures |
+| Absolute intensity threshold (Bowman ring) | Fails across images with different global staining brightness |
+| Relative percentile threshold (p65) | Carstairs green channel too uniformly bright — p65 = 208/255 |
+| Circularity filter | StarDist outputs are intrinsically star-convex — all pass |
+| Contrast ratio filter (ring/interior) | Detects tissue edges and infiltrates, not true Bowman's capsule |
 
 ---
 
-## Root Causes and Fixes
-
-| Problem | Root Cause | Fix Applied |
-|---|---|---|
-| 41 detections on training image | PATCH_SIZE=128 < glomerulus diameter (200px) — model learned fragments | Re-export with padding=150, retrain with PATCH_SIZE=320 |
-| 1145 detections on LysM_01 | Model detects inflammatory infiltrates (similar round dense morphology) | Bowman's capsule contrast ratio filter (ring/interior intensity ratio) |
-| Contrast filter not adaptive | Absolute intensity threshold fails across images with different staining | Relative contrast ratio: ring_mean / interior_mean > threshold |
-
----
-
-## Retained Architecture
+## Final Architecture
 
 ```
-102 manual QuPath annotations (ground truth)
+Manual annotations in QuPath
+  LysM_01: 193 glomeruli (exhaustive)
+  LysM_02: 165 glomeruli (exhaustive)
+  LysM_03: 158 glomeruli (exhaustive)
+  Total:   516 glomeruli across 3 slides
             ↓
-     Export patches PNG + masks
-     padding=150 → patch size 420–598 px
-     (Groovy script: export_training_patches.groovy)
+  Export full-slide images + binary masks
+  (downsample ×4 → ~7200×4060 px)
+  (Groovy script: export_nnunet.groovy)
             ↓
-  Custom StarDist training
-  PATCH_SIZE=(320,320), EPOCHS=150
-  (Python, TensorFlow Metal, M1 Max GPU, ~65 min)
+  Dataset preparation (nnU-Net format)
+  Green channel extraction, binary mask conversion
+  (Python: prepare_nnunet.py)
             ↓
-  Python inference with tiling (n_tiles ~33×58)
-  + Post-processing filters:
-    - Size filter: 10,000–80,000 px²
-    - Bowman contrast ratio: ring/interior > threshold
-  (detect_glomeruli.py)
+  nnU-Net v2 training
+  2D U-Net, patch 896×1792, MPS GPU (Apple Metal)
+  (nnUNetv2_train 1 2d 0 --npz -device mps)
             ↓
-  GeoJSON export → QuPath import
-  (Groovy script: import_geojson.groovy)
+  nnU-Net inference → segmentation masks
+            ↓
+  Mask → GeoJSON conversion → QuPath import
             ↓
   Healthy/Pathological classification
   (QuPath Object Classifier)
@@ -82,12 +84,7 @@ Semi-automated pipeline for:
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew --version
-```
-
-Expected output:
-```
-Homebrew 5.0.16
+brew --version   # → 5.0.16
 ```
 
 ### 1.3 Miniforge (native Apple Silicon conda)
@@ -102,6 +99,8 @@ conda init bash
 ```bash
 conda --version   # → 26.1.1
 ```
+
+> To check your shell: `echo $SHELL`. If zsh, use `conda init zsh` instead.
 
 ### 1.4 Dedicated Python environment
 
@@ -124,51 +123,79 @@ pip install stardist
 pip install numpy matplotlib tifffile scikit-image csbdeep jupyter
 pip install gputools
 pip install "numpy<2"        # CRITICAL: gputools upgrades numpy to 2.x which breaks TensorFlow
-pip install tf2onnx onnx     # Optional: for ONNX export attempts
 pip install shapely
 pip install opencv-python-headless
-pip install "numpy<2"        # Re-run after opencv install — it may re-upgrade numpy
+pip install "numpy<2"        # Re-run after opencv — it may re-upgrade numpy
+pip install nnunetv2
+pip install "numpy<2"        # Re-run after nnunetv2 — torch may upgrade numpy
 ```
 
-> ⚠️ Always verify numpy version after any new pip install:
-> `python -c "import numpy; print(numpy.__version__)"` must show `1.26.x`
+> ⚠️ After ANY pip install, verify: `python -c "import numpy; print(numpy.__version__)"`
+> Must show `1.26.x`. If it shows `2.x`, run `pip install "numpy<2"` again.
 
-Verification:
+Final verification:
 ```bash
-python -c "import numpy; print(numpy.__version__); import tensorflow as tf; print(tf.__version__); import stardist; print('StarDist OK')"
+python -c "import numpy; print(numpy.__version__); import tensorflow as tf; print(tf.__version__); import stardist; import nnunetv2; print('All OK')"
 ```
 
-Expected output:
+Expected:
 ```
 1.26.4
 2.16.2
-StarDist OK
+All OK
+```
+
+### 1.6 nnU-Net environment variables
+
+Add to `~/.bash_profile`:
+
+```bash
+echo '' >> ~/.bash_profile
+echo '# nnU-Net paths' >> ~/.bash_profile
+echo 'export nnUNet_raw="/Users/antonino/QuPath/nnunet_data/nnUNet_raw"' >> ~/.bash_profile
+echo 'export nnUNet_preprocessed="/Users/antonino/QuPath/nnunet_data/nnUNet_preprocessed"' >> ~/.bash_profile
+echo 'export nnUNet_results="/Users/antonino/QuPath/nnunet_data/nnUNet_results"' >> ~/.bash_profile
+source ~/.bash_profile
+```
+
+Verify:
+```bash
+echo $nnUNet_raw
+# → /Users/antonino/QuPath/nnunet_data/nnUNet_raw
 ```
 
 ---
 
 ## PART 2 — QuPath Project Setup
 
-### 2.1 Project creation
+### 2.1 Project
 
 - Launch QuPath → `File → New Project`
 - Name: `GlomAndreMarc`
 - Location: `/Users/antonino/Desktop/GlomAndreMarc`
-- Import images from `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` → `LysM_11.jpg`)
+- Images location: `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` → `LysM_11.jpg`)
 
-### 2.2 Manual annotations (ground truth)
+### 2.2 Annotation rules for nnU-Net
 
-- Open `LysM_01.jpg`
-- Brush tool (**B**) → annotate 102 glomeruli as class `Glomerulus`
-- Additional classes: `Cortex Tissue` (26), `Medulla Tissue` (16), `White` (9)
-- Total: 153 annotations
+> **Critical rule:** Every visible glomerulus in the annotated area MUST be annotated.
+> An unannotated glomerulus = the model learns it is background.
 
-> These 102 annotations = training dataset for custom StarDist model.
-> **Do not delete** — also used for Healthy/Pathological classification.
+- Tool: Brush (**B**)
+- Class: `Glomerulus`
+- Precision: paint generously to include Bowman's capsule — slight overlap is fine, missing part of a glomerulus is not
+- Coverage: exhaustive within each slide — do not annotate a subset
 
-### 2.3 Training patch export
+Final annotation counts:
+- LysM_01: **193 glomeruli**
+- LysM_02: **165 glomeruli**
+- LysM_03: **158 glomeruli**
+- **Total: 516 glomeruli**
 
-**`Automate`** → **`Project scripts`** → `export_training_patches.groovy`
+### 2.3 Export for nnU-Net
+
+In QuPath: **`Automate`** → **`Script editor`** → save as `export_nnunet.groovy`
+
+Run once per slide (open the slide first, then run):
 
 ```groovy
 import qupath.lib.regions.RegionRequest
@@ -178,348 +205,205 @@ import java.awt.image.BufferedImage
 import java.awt.Color
 import java.awt.geom.AffineTransform
 
-def outputDir  = "/Users/antonino/QuPath/training_data"
+def outputDir  = "/Users/antonino/QuPath/nnunet_data/raw"
 def className  = "Glomerulus"
-def padding    = 150          // 150px margin — ensures full glomerulus + capsule captured
-def downsample = 1.0
+def downsample = 4.0   // ×4 reduction: 28928px → ~7232px
+
+def imageData  = QP.getCurrentImageData()
+def server     = imageData.getServer()
+def imageName  = server.getMetadata().getName().replaceAll("\\.[^.]+\$", "")
 
 new File("${outputDir}/images").mkdirs()
 new File("${outputDir}/masks").mkdirs()
 
-def imageData = QP.getCurrentImageData()
-def server    = imageData.getServer()
+int W = (int)(server.getWidth()  / downsample)
+int H = (int)(server.getHeight() / downsample)
+println "→ ${imageName} | Output: ${W}×${H}"
+
+def region   = RegionRequest.createInstance(server.getPath(), downsample,
+               0, 0, server.getWidth(), server.getHeight())
+def imgPatch = server.readRegion(region)
+ImageIO.write(imgPatch, "PNG", new File("${outputDir}/images/${imageName}_0000.png"))
+
+def mask = new BufferedImage(W, H, BufferedImage.TYPE_BYTE_GRAY)
+def g2d  = mask.createGraphics()
+g2d.setColor(Color.BLACK); g2d.fillRect(0, 0, W, H)
+g2d.setColor(Color.WHITE)
 
 def annotations = QP.getAnnotationObjects().findAll {
-    it.getPathClass() != null &&
-    it.getPathClass().getName() == className
+    it.getPathClass()?.getName() == className
 }
+println "→ ${annotations.size()} '${className}' annotations"
 
-println "→ ${annotations.size()} '${className}' annotations found"
-if (annotations.isEmpty()) { println "⚠ No annotations found."; return }
-
-int count = 0
-annotations.eachWithIndex { annotation, idx ->
-    def roi = annotation.getROI()
-    int x = Math.max(0, (int)(roi.getBoundsX() - padding))
-    int y = Math.max(0, (int)(roi.getBoundsY() - padding))
-    int w = Math.min(server.getWidth()  - x, (int)(roi.getBoundsWidth()  + 2 * padding))
-    int h = Math.min(server.getHeight() - y, (int)(roi.getBoundsHeight() + 2 * padding))
-
-    def region   = RegionRequest.createInstance(server.getPath(), downsample, x, y, w, h)
-    def imgPatch = server.readRegion(region)
-    ImageIO.write(imgPatch, "PNG", new File("${outputDir}/images/glom_${String.format('%03d', idx)}.png"))
-
-    def mask = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY)
-    def g2d  = mask.createGraphics()
-    g2d.setColor(Color.BLACK); g2d.fillRect(0, 0, w, h)
-    g2d.setColor(Color.WHITE)
-    def t = new AffineTransform(); t.translate(-x as double, -y as double)
-    g2d.fill(t.createTransformedShape(roi.getShape()))
-    g2d.dispose()
-    ImageIO.write(mask, "PNG", new File("${outputDir}/masks/glom_${String.format('%03d', idx)}.png"))
-
-    count++
-    if (count % 10 == 0) println "  ${count}/${annotations.size()} exported..."
+annotations.each { annotation ->
+    def t = new AffineTransform()
+    t.scale(1.0/downsample, 1.0/downsample)
+    g2d.fill(t.createTransformedShape(annotation.getROI().getShape()))
 }
-println "✓ Export complete: ${count} pairs in ${outputDir}"
+g2d.dispose()
+
+ImageIO.write(mask, "PNG", new File("${outputDir}/masks/${imageName}.png"))
+println "✓ Export complete: ${imageName}"
 ```
 
-Expected result: **102 pairs**, patch size min 420×397 px, max 598×625 px
-
----
-
-## PART 3 — Custom StarDist Training
-
-### 3.1 Training script
-
-```bash
-mkdir -p /Users/antonino/QuPath/training
-nano /Users/antonino/QuPath/training/train_stardist_glom.py
+Expected output per slide:
 ```
-
-```python
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-import numpy as np
-from glob import glob
-from skimage.io import imread as sk_imread
-from skimage.transform import resize as sk_resize
-from csbdeep.utils import normalize
-from stardist import fill_label_holes
-from stardist.models import Config2D, StarDist2D
-import tensorflow as tf
-
-print(f"TensorFlow: {tf.__version__}")
-print(f"GPU available: {tf.config.list_physical_devices('GPU')}")
-
-DATA_DIR   = "/Users/antonino/QuPath/training_data"
-MODEL_DIR  = "/Users/antonino/QuPath/models"
-MODEL_NAME = "glomerulus_carstairs"
-PATCH_SIZE = (320, 320)
-N_RAYS     = 32
-EPOCHS     = 150
-
-img_paths  = sorted(glob(os.path.join(DATA_DIR, "images", "*.png")))
-mask_paths = sorted(glob(os.path.join(DATA_DIR, "masks",  "*.png")))
-
-assert len(img_paths) == len(mask_paths)
-print(f"→ {len(img_paths)} images found")
-
-images, masks = [], []
-for ip, mp in zip(img_paths, mask_paths):
-    img = sk_imread(ip)
-    img = img[:, :, 1].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
-    msk = sk_imread(mp)
-    msk = msk[:, :, 0] if msk.ndim == 3 else msk
-    msk = (msk > 128).astype(np.uint16)
-    msk = fill_label_holes(msk)
-    images.append(img)
-    masks.append(msk)
-
-sizes = [img.shape for img in images]
-print(f"→ Min: {min(s[0] for s in sizes)}×{min(s[1] for s in sizes)} | Max: {max(s[0] for s in sizes)}×{max(s[1] for s in sizes)}")
-
-images_r, masks_r = [], []
-for img, msk in zip(images, masks):
-    if img.shape[0] < PATCH_SIZE[0] or img.shape[1] < PATCH_SIZE[1]:
-        img = sk_resize(img, PATCH_SIZE, preserve_range=True).astype(np.float32)
-        msk = sk_resize(msk, PATCH_SIZE, preserve_range=True, order=0).astype(np.uint16)
-    images_r.append(img); masks_r.append(msk)
-
-n_val   = max(1, int(len(images_r) * 0.2))
-n_train = len(images_r) - n_val
-X_train = [normalize(x, 1, 99) for x in images_r[:n_train]]
-Y_train = masks_r[:n_train]
-X_val   = [normalize(x, 1, 99) for x in images_r[n_train:]]
-Y_val   = masks_r[n_train:]
-print(f"→ Train: {n_train} | Validation: {n_val}")
-
-conf = Config2D(
-    n_rays=N_RAYS, grid=(2,2), n_channel_in=1,
-    train_patch_size=PATCH_SIZE, train_epochs=EPOCHS,
-    train_steps_per_epoch=100, train_batch_size=2, use_gpu=True,
-)
-
-os.makedirs(MODEL_DIR, exist_ok=True)
-model = StarDist2D(conf, name=MODEL_NAME, basedir=MODEL_DIR)
-print(f"→ Training {EPOCHS} epochs...")
-
-model.train(X_train, Y_train, validation_data=(X_val, Y_val), augmenter=None)
-model.optimize_thresholds(X_val, Y_val)
-
-print(f"✓ Training complete: {MODEL_DIR}/{MODEL_NAME}")
-```
-
-### 3.2 Launch
-
-```bash
-cd /Users/antonino/QuPath/training
-python train_stardist_glom.py
-```
-
-Expected: ~65 min, final optimized thresholds `prob_thresh=0.793594, nms_thresh=0.3`
-
-### 3.3 Output
-
-```
-/Users/antonino/QuPath/models/glomerulus_carstairs/
-    ├── config.json
-    ├── thresholds.json      ← prob_thresh=0.793594, nms_thresh=0.3
-    ├── weights_best.h5
-    ├── weights_last.h5
-    └── logs/
+→ LysM_01 | Output: 7232×4060
+→ 193 'Glomerulus' annotations
+✓ Export complete: LysM_01
 ```
 
 ---
 
-## PART 4 — Inference and GeoJSON Export
+## PART 3 — nnU-Net Dataset Preparation
 
-> **Why Python inference instead of QuPath native?**
-> QuPath 0.7.0 uses OpenCV 4.11 + DJL. OpenCV 4.11 rejects ONNX models with dynamic shapes.
-> DJL could not load the StarDist .h5 model either.
-> Solution: run inference in Python with Metal GPU, export as GeoJSON, import into QuPath natively.
-
-### 4.1 Detection script
+### 3.1 Prepare dataset structure
 
 ```bash
-nano /Users/antonino/QuPath/training/detect_glomeruli.py
+nano /Users/antonino/QuPath/training/prepare_nnunet.py
 ```
 
 ```python
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-import json
-import numpy as np
-from glob import glob
+import os, json, numpy as np
 from PIL import Image
-Image.MAX_IMAGE_PIXELS = None
-from shapely.geometry import Polygon
-from shapely.affinity import scale
-from csbdeep.utils import normalize
-from stardist.models import StarDist2D
-import cv2
+from pathlib import Path
 
-# ── PARAMETERS ────────────────────────────────────────────────
-IMAGE_DIR          = "/Users/antonino/Desktop/Export pics"
-MODEL_DIR          = "/Users/antonino/QuPath/models"
-MODEL_NAME         = "glomerulus_carstairs"
-OUTPUT_DIR         = "/Users/antonino/Desktop/GlomAndreMarc/detections"
-PROB_THRESH        = 0.793
-NMS_THRESH         = 0.3
-MIN_AREA_PX        = 10000
-MAX_AREA_PX        = 80000
-BOWMAN_RING_FACTOR = 1.3
-MIN_CONTRAST_RATIO = 1.10   # ring_mean / interior_mean — calibrated on LysM_01
-# Contrast ratio distribution on LysM_01: min=0.775 mean=1.029 max=1.317
-# True glomeruli expected at ratio > 1.10
-# ─────────────────────────────────────────────────────────────
+RAW_DIR      = "/Users/antonino/QuPath/nnunet_data/raw"
+NNUNET_DIR   = "/Users/antonino/QuPath/nnunet_data"
+DATASET_ID   = 1
+DATASET_NAME = "GlomCarstairs"
 
-def coords_to_polygon(coords):
-    y_arr, x_arr = coords[0], coords[1]
-    pts = [[float(x_arr[j]), float(y_arr[j])] for j in range(len(y_arr))]
-    pts.append(pts[0])
-    return pts
+dataset_name = f"Dataset{DATASET_ID:03d}_{DATASET_NAME}"
+base         = Path(NNUNET_DIR) / "nnUNet_raw" / dataset_name
+tr_images    = base / "imagesTr"
+tr_labels    = base / "labelsTr"
+tr_images.mkdir(parents=True, exist_ok=True)
+tr_labels.mkdir(parents=True, exist_ok=True)
 
-def contrast_ratio(img_green, poly, factor, img_shape):
-    H, W  = img_shape
-    outer = scale(poly, xfact=factor, yfact=factor)
-    mask_i = np.zeros((H, W), dtype=np.uint8)
-    mask_o = np.zeros((H, W), dtype=np.uint8)
+print(f"→ Preparing: {dataset_name}")
+image_files = sorted(Path(RAW_DIR, "images").glob("*.png"))
+cases = []
 
-    def to_cv2(p):
-        return np.array([[int(x), int(y)] for x, y in p.exterior.coords], dtype=np.int32)
+for img_path in image_files:
+    case_name = img_path.stem.replace("_0000", "")
+    cases.append(case_name)
 
-    try:
-        cv2.fillPoly(mask_i, [to_cv2(poly)],  1)
-        cv2.fillPoly(mask_o, [to_cv2(outer)], 1)
-    except Exception:
-        return 0
+    # Extract green channel (single channel for nnU-Net)
+    img_green = np.array(Image.open(img_path).convert("RGB"))[:, :, 1]
+    Image.fromarray(img_green).save(tr_images / img_path.name)
+    print(f"   Image: {img_path.name} → shape={img_green.shape}")
 
-    interior = mask_i > 0
-    ring     = (mask_o - mask_i) > 0
+    # Binary mask: 0=background, 1=glomerulus
+    mask = np.array(Image.open(Path(RAW_DIR, "masks", f"{case_name}.png")).convert("L"))
+    mask_bin = (mask > 128).astype(np.uint8)
+    Image.fromarray(mask_bin).save(tr_labels / f"{case_name}.png")
+    print(f"   Mask:  {case_name}.png → glom pixels: {mask_bin.sum():,}")
 
-    if interior.sum() == 0 or ring.sum() == 0:
-        return 0
+dataset_json = {
+    "channel_names": {"0": "Green"},
+    "labels": {"background": 0, "Glomerulus": 1},
+    "numTraining": len(cases),
+    "file_ending": ".png",
+    "overwrite_image_reader_writer": "NaturalImage2DIO"
+}
+with open(base / "dataset.json", "w") as f:
+    json.dump(dataset_json, f, indent=2)
 
-    interior_mean = float(img_green[interior].mean())
-    if interior_mean == 0:
-        return 0
+for p in ["nnUNet_preprocessed", "nnUNet_results"]:
+    (Path(NNUNET_DIR) / p).mkdir(parents=True, exist_ok=True)
 
-    return float(img_green[ring].mean()) / interior_mean
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-model = StarDist2D(None, name=MODEL_NAME, basedir=MODEL_DIR)
-
-image_paths = sorted(glob(os.path.join(IMAGE_DIR, "LysM_*.jpg")))
-print(f"→ {len(image_paths)} images found\n")
-
-for image_path in image_paths:
-    image_name  = os.path.splitext(os.path.basename(image_path))[0]
-    output_json = os.path.join(OUTPUT_DIR, f"{image_name}_detections.geojson")
-    print(f"→ Processing: {image_name}")
-
-    img       = np.array(Image.open(image_path))
-    H, W      = img.shape[:2]
-    img_green = img[:, :, 1].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
-    img_norm  = normalize(img_green, 1, 99)
-
-    n_ty = max(1, int(np.ceil(H / 500)))
-    n_tx = max(1, int(np.ceil(W / 500)))
-
-    labels, details = model.predict_instances(
-        img_norm, prob_thresh=PROB_THRESH, nms_thresh=NMS_THRESH, n_tiles=(n_ty, n_tx)
-    )
-
-    coords_list = details['coord']
-    print(f"   {len(coords_list)} raw detections")
-
-    features = []
-    skip_area = skip_contrast = 0
-    ratios = []
-
-    for coords in coords_list:
-        pts  = coords_to_polygon(coords)
-        poly = Polygon(pts)
-        area = poly.area
-
-        if area < MIN_AREA_PX or area > MAX_AREA_PX:
-            skip_area += 1
-            continue
-
-        ratio = contrast_ratio(img_green, poly, BOWMAN_RING_FACTOR, (H, W))
-        ratios.append(ratio)
-
-        if ratio < MIN_CONTRAST_RATIO:
-            skip_contrast += 1
-            continue
-
-        features.append({
-            "type": "Feature",
-            "geometry": {"type": "Polygon", "coordinates": [pts]},
-            "properties": {
-                "objectType": "detection",
-                "classification": {"name": "Glomerulus", "color": [200, 0, 0]},
-                "name":           f"Glomerulus_{len(features)+1:04d}",
-                "area_px":        round(area, 1),
-                "contrast_ratio": round(ratio, 3),
-            }
-        })
-
-    if ratios:
-        print(f"   Contrast: min={min(ratios):.3f} mean={np.mean(ratios):.3f} max={max(ratios):.3f}")
-    print(f"   Filtered: {skip_area} by area | {skip_contrast} by contrast")
-    print(f"   {len(features)} glomeruli retained")
-
-    with open(output_json, 'w') as f:
-        json.dump({"type": "FeatureCollection", "features": features}, f, indent=2)
-    print(f"   ✓ Saved: {output_json}\n")
-
-print("✓ All images processed")
-print(f"✓ GeoJSON files in: {OUTPUT_DIR}")
+print(f"\n✓ Dataset ready: {base}")
+print(f"→ Cases: {cases}")
 ```
-
-### 4.2 Launch
 
 ```bash
-cd /Users/antonino/QuPath/training
-python detect_glomeruli.py
+python /Users/antonino/QuPath/training/prepare_nnunet.py
 ```
 
-### 4.3 Import into QuPath
+### 3.2 Create manual cross-validation split
 
-For each image, in QuPath Script Editor:
+With only 3 images, nnU-Net's default 5-fold split fails. Create a manual split:
 
-```groovy
-import qupath.lib.io.GsonTools
-import java.nio.file.Files
-import java.nio.file.Paths
-import com.google.gson.JsonParser
-
-def geojsonPath = "/Users/antonino/Desktop/GlomAndreMarc/detections/LysM_01_detections.geojson"
-def imageData   = getCurrentImageData()
-
-def json        = new String(Files.readAllBytes(Paths.get(geojsonPath)))
-def root        = JsonParser.parseString(json).getAsJsonObject()
-def featuresArr = root.getAsJsonArray("features")
-
-println "→ ${featuresArr.size()} features in GeoJSON"
-
-def objects = GsonTools.getInstance().fromJson(
-    featuresArr,
-    new com.google.gson.reflect.TypeToken<List<qupath.lib.objects.PathObject>>(){}.getType()
-)
-
-println "→ ${objects.size()} objects parsed"
-imageData.getHierarchy().addObjects(objects)
-fireHierarchyUpdate()
-println "✓ Objects imported"
+```bash
+nano /Users/antonino/QuPath/training/create_split.py
 ```
+
+```python
+import json
+from pathlib import Path
+
+split = [
+    {"train": ["LysM_01", "LysM_02"], "val": ["LysM_03"]},
+    {"train": ["LysM_01", "LysM_03"], "val": ["LysM_02"]},
+    {"train": ["LysM_02", "LysM_03"], "val": ["LysM_01"]},
+    {"train": ["LysM_01", "LysM_02"], "val": ["LysM_03"]},
+    {"train": ["LysM_01", "LysM_03"], "val": ["LysM_02"]}
+]
+
+out = Path("/Users/antonino/QuPath/nnunet_data/nnUNet_preprocessed/Dataset001_GlomCarstairs/splits_final.json")
+with open(out, "w") as f:
+    json.dump(split, f, indent=2)
+print(f"✓ Split file written: {out}")
+```
+
+```bash
+python /Users/antonino/QuPath/training/create_split.py
+```
+
+### 3.3 Preprocess dataset
+
+```bash
+nnUNetv2_plan_and_preprocess -d 1 --verify_dataset_integrity
+```
+
+Expected output:
+```
+verify_dataset_integrity Done.
+If you didn't see any error messages then your dataset is most likely OK!
+Preprocessing cases: 100%|█████| 3/3
+```
+
+Auto-selected configuration:
+- Architecture: 2D PlainConvUNet, 9 stages
+- Patch size: 896×1792 px
+- Batch size: 2
 
 ---
 
-## PART 5 — Healthy/Pathological Classification
+## PART 4 — nnU-Net Training
+
+```bash
+conda activate stardist-glom
+nnUNetv2_train 1 2d 0 --npz -device mps
+```
+
+Parameters:
+- `1` = Dataset ID
+- `2d` = 2D configuration
+- `0` = fold 0 (2 train / 1 validation)
+- `--npz` = save validation predictions
+- `-device mps` = Apple Metal GPU (mandatory on M1/M2/M3)
+
+Expected output at start:
+```
+Using device: mps
+This split has 2 training and 1 validation cases.
+Epoch 0
+Current learning rate: 0.01
+```
+
+> Default: 1000 epochs. Results saved to:
+> `/Users/antonino/QuPath/nnunet_data/nnUNet_results/Dataset001_GlomCarstairs/`
+
+---
+
+## PART 5 — Inference and QuPath Import
+
+*(To be completed after training)*
+
+---
+
+## PART 6 — Healthy/Pathological Classification
 
 *(To be completed after detection validation)*
 
@@ -527,15 +411,12 @@ println "✓ Objects imported"
 
 ## Technical Notes
 
-- Average glomerulus diameter: **~200 px** (measured: 204 px)
-- Training patch size (padding=150): **min 420×397 px, max 598×625 px**
-- Training PATCH_SIZE: **320×320** (must exceed glomerulus diameter)
-- Optimized detection thresholds: **prob_thresh=0.793594, nms_thresh=0.3**
-- Calibration: **~1 µm/pixel** (estimated — no JPEG metadata)
+- Glomerulus diameter: **~200 px** at full resolution (~204 px measured)
+- Export downsample: **×4** → images ~7200×4060 px for nnU-Net
+- Annotation exhaustiveness: **mandatory** — every visible glomerulus must be labeled
 - Staining: **Carstairs** — color deconvolution not applicable
 - Optimal channel: **Green (index 1)** — best contrast for Carstairs
-- Glomeruli: star-convex, ~200 µm, dense mauve interior + bright Bowman's capsule ring
-- Contrast ratio (ring/interior green intensity): glomeruli > 1.10, infiltrates ≈ 1.00–1.05
-- GPU: Apple M1 Max Metal, 32 GB unified memory
-- Images: 11 files, ~469M pixels (28928×16240 or 28800×16240 px)
-- numpy must stay at **1.26.4** — any pip install may silently upgrade it
+- GPU backend: **Apple MPS** (Metal) — use `-device mps` flag, not cuda
+- numpy must stay at **1.26.4** — verify after every pip install
+- Images: 11 slides, ~469M pixels each (28928×16240 or 28800×16240 px)
+- Dataset: 3 annotated slides, 516 glomeruli total, split 2 train / 1 val
