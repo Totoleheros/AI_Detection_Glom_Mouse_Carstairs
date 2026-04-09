@@ -44,27 +44,27 @@ nnU-Net is a **semantic segmentation** framework based on U-Net architecture. It
 ## Final Architecture
 
 ```
-Manual annotations in QuPath
-  LysM_01: 193 glomeruli (exhaustive)
-  LysM_02: 165 glomeruli (exhaustive)
-  LysM_03: 158 glomeruli (exhaustive)
+Manual annotations in QuPath (exhaustive per slide)
+  LysM_01: 193 glomeruli
+  LysM_02: 165 glomeruli
+  LysM_03: 158 glomeruli
   Total:   516 glomeruli across 3 slides
             ↓
   Export full-slide images + binary masks
-  (downsample ×4 → ~7200×4060 px)
-  (Groovy script: export_nnunet.groovy)
-            ↓
-  Dataset preparation (nnU-Net format)
-  Green channel extraction, binary mask conversion
+  Downsample ×4 → ~7200×4060 px
+  Green channel extraction (optimal for Carstairs)
+  (QuPath Groovy: export_nnunet.groovy)
   (Python: prepare_nnunet.py)
             ↓
   nnU-Net v2 training
-  2D U-Net, patch 896×1792, MPS GPU (Apple Metal)
-  (nnUNetv2_train 1 2d 0 --npz -device mps)
+  2D U-Net, patch 896×1792 px
+  100 epochs, MPS GPU (Apple Metal)
+  ~11 hours on M1 Max
+  (nnUNetv2_train 1 2d 0 --npz -device mps -tr nnUNetTrainer_100epochs)
             ↓
-  nnU-Net inference → segmentation masks
+  nnU-Net inference → binary segmentation masks
             ↓
-  Mask → GeoJSON conversion → QuPath import
+  Mask → polygon → GeoJSON → QuPath import
             ↓
   Healthy/Pathological classification
   (QuPath Object Classifier)
@@ -117,21 +117,26 @@ python --version   # → Python 3.10.20
 
 ### 1.5 Python dependencies
 
+Install in this exact order — numpy must stay at 1.26.x throughout:
+
 ```bash
 pip install tensorflow-macos tensorflow-metal
 pip install stardist
 pip install numpy matplotlib tifffile scikit-image csbdeep jupyter
 pip install gputools
-pip install "numpy<2"        # CRITICAL: gputools upgrades numpy to 2.x which breaks TensorFlow
+pip install "numpy<2"               # gputools upgrades numpy to 2.x — revert
 pip install shapely
 pip install opencv-python-headless
-pip install "numpy<2"        # Re-run after opencv — it may re-upgrade numpy
-pip install nnunetv2
-pip install "numpy<2"        # Re-run after nnunetv2 — torch may upgrade numpy
+pip install "numpy<2"               # opencv may upgrade numpy — revert
+pip install nnunetv2                # installs PyTorch 2.11.0 + torchvision
+pip install "numpy<2"               # nnunetv2/torch may upgrade numpy — revert
 ```
 
-> ⚠️ After ANY pip install, verify: `python -c "import numpy; print(numpy.__version__)"`
-> Must show `1.26.x`. If it shows `2.x`, run `pip install "numpy<2"` again.
+> ⚠️ **After ANY pip install**, always verify:
+> ```bash
+> python -c "import numpy; print(numpy.__version__)"
+> ```
+> Must show `1.26.x`. If `2.x` appears, run `pip install "numpy<2"` immediately.
 
 Final verification:
 ```bash
@@ -146,8 +151,6 @@ All OK
 ```
 
 ### 1.6 nnU-Net environment variables
-
-Add to `~/.bash_profile`:
 
 ```bash
 echo '' >> ~/.bash_profile
@@ -164,6 +167,9 @@ echo $nnUNet_raw
 # → /Users/antonino/QuPath/nnunet_data/nnUNet_raw
 ```
 
+> These variables must be set in every new Terminal session.
+> They are loaded automatically via `~/.bash_profile` on shell start.
+
 ---
 
 ## PART 2 — QuPath Project Setup
@@ -173,19 +179,19 @@ echo $nnUNet_raw
 - Launch QuPath → `File → New Project`
 - Name: `GlomAndreMarc`
 - Location: `/Users/antonino/Desktop/GlomAndreMarc`
-- Images location: `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` → `LysM_11.jpg`)
+- Images: `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` → `LysM_11.jpg`)
 
 ### 2.2 Annotation rules for nnU-Net
 
-> **Critical rule:** Every visible glomerulus in the annotated area MUST be annotated.
-> An unannotated glomerulus = the model learns it is background.
+> **Critical rule:** Every visible glomerulus in each annotated slide MUST be labeled.
+> An unannotated glomerulus = the model learns it is background = catastrophic for training.
 
 - Tool: Brush (**B**)
 - Class: `Glomerulus`
-- Precision: paint generously to include Bowman's capsule — slight overlap is fine, missing part of a glomerulus is not
-- Coverage: exhaustive within each slide — do not annotate a subset
+- Precision: paint to include Bowman's capsule — slight overshoot is fine, undershoot is not
+- Coverage: **exhaustive** — annotate all glomeruli on the slide, not a subset
 
-Final annotation counts:
+Annotation counts (verified exhaustive):
 - LysM_01: **193 glomeruli**
 - LysM_02: **165 glomeruli**
 - LysM_03: **158 glomeruli**
@@ -195,7 +201,7 @@ Final annotation counts:
 
 In QuPath: **`Automate`** → **`Script editor`** → save as `export_nnunet.groovy`
 
-Run once per slide (open the slide first, then run):
+Run once per slide (open slide first, then run):
 
 ```groovy
 import qupath.lib.regions.RegionRequest
@@ -259,9 +265,7 @@ Expected output per slide:
 
 ### 3.1 Prepare dataset structure
 
-```bash
-nano /Users/antonino/QuPath/training/prepare_nnunet.py
-```
+File: `/Users/antonino/QuPath/training/prepare_nnunet.py`
 
 ```python
 import os, json, numpy as np
@@ -288,7 +292,7 @@ for img_path in image_files:
     case_name = img_path.stem.replace("_0000", "")
     cases.append(case_name)
 
-    # Extract green channel (single channel for nnU-Net)
+    # Extract green channel only (nnU-Net requires single channel)
     img_green = np.array(Image.open(img_path).convert("RGB"))[:, :, 1]
     Image.fromarray(img_green).save(tr_images / img_path.name)
     print(f"   Image: {img_path.name} → shape={img_green.shape}")
@@ -313,20 +317,18 @@ for p in ["nnUNet_preprocessed", "nnUNet_results"]:
     (Path(NNUNET_DIR) / p).mkdir(parents=True, exist_ok=True)
 
 print(f"\n✓ Dataset ready: {base}")
-print(f"→ Cases: {cases}")
 ```
 
 ```bash
 python /Users/antonino/QuPath/training/prepare_nnunet.py
 ```
 
-### 3.2 Create manual cross-validation split
+### 3.2 Manual cross-validation split
 
-With only 3 images, nnU-Net's default 5-fold split fails. Create a manual split:
+With only 3 images, nnU-Net's default 5-fold split fails (n_splits=5 > n_samples=3).
+Create a manual split file:
 
-```bash
-nano /Users/antonino/QuPath/training/create_split.py
-```
+File: `/Users/antonino/QuPath/training/create_split.py`
 
 ```python
 import json
@@ -343,7 +345,7 @@ split = [
 out = Path("/Users/antonino/QuPath/nnunet_data/nnUNet_preprocessed/Dataset001_GlomCarstairs/splits_final.json")
 with open(out, "w") as f:
     json.dump(split, f, indent=2)
-print(f"✓ Split file written: {out}")
+print(f"✓ Split written: {out}")
 ```
 
 ```bash
@@ -356,7 +358,7 @@ python /Users/antonino/QuPath/training/create_split.py
 nnUNetv2_plan_and_preprocess -d 1 --verify_dataset_integrity
 ```
 
-Expected output:
+Expected:
 ```
 verify_dataset_integrity Done.
 If you didn't see any error messages then your dataset is most likely OK!
@@ -365,35 +367,61 @@ Preprocessing cases: 100%|█████| 3/3
 
 Auto-selected configuration:
 - Architecture: 2D PlainConvUNet, 9 stages
-- Patch size: 896×1792 px
+- Patch size: **896×1792 px**
 - Batch size: 2
+- Normalization: ZScore
 
 ---
 
 ## PART 4 — nnU-Net Training
 
+### 4.1 Training command
+
 ```bash
 conda activate stardist-glom
-nnUNetv2_train 1 2d 0 --npz -device mps
+nnUNetv2_train 1 2d 0 --npz -device mps -tr nnUNetTrainer_100epochs
 ```
 
 Parameters:
 - `1` = Dataset ID
-- `2d` = 2D configuration
+- `2d` = 2D U-Net configuration (auto-selected — correct for 2D histology)
 - `0` = fold 0 (2 train / 1 validation)
-- `--npz` = save validation predictions
-- `-device mps` = Apple Metal GPU (mandatory on M1/M2/M3)
+- `--npz` = save validation predictions for later analysis
+- `-device mps` = Apple Metal GPU — **mandatory on M1/M2/M3, never use cuda**
+- `-tr nnUNetTrainer_100epochs` = 100 epochs instead of default 1000
 
-Expected output at start:
+> Other available epoch counts: 5, 10, 20, 50, 100, 250, 500, 750, 1000, 2000, 4000, 8000
+> Located in: `nnunetv2/training/nnUNetTrainer/variants/training_length/nnUNetTrainer_Xepochs.py`
+
+### 4.2 Expected training output
+
 ```
 Using device: mps
 This split has 2 training and 1 validation cases.
 Epoch 0
 Current learning rate: 0.01
+train_loss -0.0148
+val_loss -0.4328
+Pseudo dice [0.5407]          ← Already >0.5 at epoch 0 — good signal
+Epoch time: 392.79 s          ← ~6.5 min/epoch on M1 Max
+Yayy! New best EMA pseudo Dice: 0.5407
 ```
 
-> Default: 1000 epochs. Results saved to:
+> Estimated total duration: **~11 hours** (392s × 100 epochs)
+> Model checkpoints saved to:
 > `/Users/antonino/QuPath/nnunet_data/nnUNet_results/Dataset001_GlomCarstairs/`
+
+### 4.3 Training outputs
+
+```
+nnUNet_results/Dataset001_GlomCarstairs/
+    nnUNetTrainer_100epochs__nnUNetPlans__2d/
+        fold_0/
+            checkpoint_best.pth      ← best model by Dice
+            checkpoint_final.pth     ← final epoch model
+            training_log.txt
+            validation/
+```
 
 ---
 
@@ -411,12 +439,14 @@ Current learning rate: 0.01
 
 ## Technical Notes
 
-- Glomerulus diameter: **~200 px** at full resolution (~204 px measured)
+- Glomerulus diameter: **~200 px** at full resolution (measured: 204 px)
 - Export downsample: **×4** → images ~7200×4060 px for nnU-Net
-- Annotation exhaustiveness: **mandatory** — every visible glomerulus must be labeled
+- Annotation rule: **exhaustive per slide** — every visible glomerulus must be labeled
 - Staining: **Carstairs** — color deconvolution not applicable
 - Optimal channel: **Green (index 1)** — best contrast for Carstairs
-- GPU backend: **Apple MPS** (Metal) — use `-device mps` flag, not cuda
+- GPU backend: **Apple MPS** (Metal) — always use `-device mps`, never cuda
+- PyTorch version: 2.11.0 (installed with nnunetv2)
 - numpy must stay at **1.26.4** — verify after every pip install
 - Images: 11 slides, ~469M pixels each (28928×16240 or 28800×16240 px)
-- Dataset: 3 annotated slides, 516 glomeruli total, split 2 train / 1 val
+- Training dataset: 3 slides, 516 glomeruli total, fold 0 = 2 train / 1 val
+- Epoch 0 Pseudo Dice: **0.5407** — strong initial signal
