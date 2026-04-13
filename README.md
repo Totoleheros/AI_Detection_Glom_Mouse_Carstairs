@@ -8,7 +8,7 @@ Staining: Carstairs | Images: Brightfield JPEG (~28928 × 16240 px)
 
 Semi-automated pipeline for:
 1. Detecting glomeruli on kidney sections (Brightfield, Carstairs staining)
-2. Classifying them by pathological status (Healthy vs Pathological)
+2. Classifying them by pathological status (Normal / Inflammatory infiltrate / Mesangial expansion / Crescent / Global sclerosis / Segmental sclerosis / Ischemic collapse / Thrombosis)
 
 **Target environment:** Mac M1 Max, QuPath 0.7.0-arm64, Python via Miniforge
 
@@ -41,44 +41,70 @@ nnU-Net is a **semantic segmentation** framework based on U-Net architecture. It
 
 ---
 
+## Model Training History
+
+> Validation Dice is the key performance metric.
+> Dice = 1.0 is perfect segmentation. Published models on renal glomeruli: 0.80–0.92.
+
+| Round | Slides | Glomeruli | Val Dice | EMA Dice | Notes |
+|---|---|---|---|---|---|
+| Round 1 | 3 | 516 | 0.765 | 0.738 | LysM_01–03, manual annotations only |
+| Round 2 | 6 | 1199 | **0.821** | **0.861** | +3 slides corrected from Round 1 predictions |
+| Round 3 | 11 | **2239** | TBD | TBD | All slides, exhaustive annotations |
+
+### Round 1 details
+- Training slides: LysM_01 (193), LysM_02 (165), LysM_03 (158)
+- Validation slide: LysM_03
+- Epoch 0 Dice: 0.595 | Final val Dice: 0.765
+- Duration: ~10h on M1 Max (100 epochs × ~370s)
+
+### Round 2 details
+- Added slides: LysM_04 (218), LysM_05 (175), LysM_06 (290) — nnU-Net predictions + manual correction
+- Validation slide: LysM_06
+- Epoch 0 Dice: 0.628 (+0.033 vs Round 1) | Epoch 1 Dice: 0.726 (+0.077)
+- Final val Dice: **0.821** | EMA Dice: **0.861**
+- Duration: ~10h on M1 Max
+
+### Round 3 details (in progress)
+- All 11 slides with exhaustive manual annotations
+- LysM_01: 192 | LysM_02: 165 | LysM_03: 158 | LysM_04: 218 | LysM_05: 175
+- LysM_06: 290 | LysM_07: 218 | LysM_08: 185 | LysM_09: 219 | LysM_10: 210 | LysM_11: 209
+- Fold 0: 9 train / 2 val (LysM_01, LysM_02)
+- Status: 🔄 Training in progress
+
+---
+
 ## Full Pipeline Architecture
 
 ```
-PHASE 1 — INITIAL TRAINING (one-time setup)
-─────────────────────────────────────────────
-Manual annotations in QuPath (exhaustive per slide)
-  LysM_01: 193 glomeruli  ──┐
-  LysM_02: 165 glomeruli    │ Round 1 training data
-  LysM_03: 158 glomeruli  ──┘
+PHASE 1 — DETECTION (nnU-Net)
+──────────────────────────────
+Exhaustive manual annotations in QuPath
             ↓
-  Export + nnU-Net training Round 1
-  (Dice validation: 0.765)
+  export_nnunet.groovy (QuPath)
+  prepare_nnunet.py
+  create_split.py
+  nnUNetv2_plan_and_preprocess
+  nnUNetv2_train -device mps
             ↓
-  Predict on LysM_04, 05, 06
-  Manual correction in QuPath
-  LysM_04: 218 glomeruli  ──┐
-  LysM_05: 175 glomeruli    │ Round 2 added data
-  LysM_06: 290 glomeruli  ──┘
+  nnUNetv2_predict → binary masks
+  masks_to_geojson.py → GeoJSON
+  import in QuPath → review & correct
             ↓
-  nnU-Net training Round 2 (6 slides total, 1199 glomeruli)
-  Epoch 0 Dice: 0.628 (vs 0.595 in Round 1)
-  Epoch 1 Dice: 0.726 (vs 0.649 in Round 1)
+  Iterative: add corrected slides → retrain
 
-PHASE 2 — DEPLOYMENT (on any new image set)
-─────────────────────────────────────────────
-New images
-  → prepare_predict.py    (~2 min)
-  → nnUNetv2_predict      (~8 min for 11 images)
-  → masks_to_geojson.py   (~1 min)
-  → Import in QuPath      (~30 sec/image)
-
-PHASE 3 — CLASSIFICATION (planned)
-─────────────────────────────────────────────
-Detected glomeruli
-  → Extract patches per glomerulus
-  → GUI sorting tool (Healthy / Pathological / Uncertain)
-  → Train classifier on labeled patches
-  → Auto-classification in QuPath
+PHASE 2 — CLASSIFICATION (planned)
+────────────────────────────────────
+Detected glomeruli → patch extraction
+            ↓
+  GUI sorting tool (local web app)
+  Classes: Normal / Inflammatory infiltrate /
+           Mesangial expansion / Crescent /
+           Global sclerosis / Segmental sclerosis /
+           Ischemic collapse / Thrombosis
+            ↓
+  Train classifier (PyTorch ResNet, MPS GPU)
+  Auto-classify in QuPath via GeoJSON
 ```
 
 ---
@@ -143,8 +169,9 @@ pip install nnunetv2
 pip install "numpy<2"
 ```
 
-> ⚠️ After ANY pip install, verify: `python -c "import numpy; print(numpy.__version__)"`
-> Must show `1.26.x`. If `2.x` appears, run `pip install "numpy<2"` immediately.
+> ⚠️ After ANY pip install, verify numpy:
+> `python -c "import numpy; print(numpy.__version__)"`
+> Must show `1.26.x`. If `2.x` appears: `pip install "numpy<2"`
 
 Final verification:
 ```bash
@@ -169,8 +196,7 @@ echo 'export nnUNet_results="/Users/antonino/QuPath/nnunet_data/nnUNet_results"'
 source ~/.bash_profile
 ```
 
-> These variables must be reloaded in each new Terminal session:
-> `source ~/.bash_profile` then `conda activate stardist-glom`
+> Reload in each new Terminal: `source ~/.bash_profile` then `conda activate stardist-glom`
 
 ---
 
@@ -183,19 +209,18 @@ source ~/.bash_profile
 - Location: `/Users/antonino/Desktop/GlomAndreMarc`
 - Images: `/Users/antonino/Desktop/Export pics/` (`LysM_01.jpg` → `LysM_11.jpg`)
 
-### 2.2 Annotation rules (critical for nnU-Net)
+### 2.2 Annotation rules (critical)
 
-> Every visible glomerulus in each annotated slide MUST be labeled.
-> An unannotated glomerulus = the model learns it is background.
+> Every visible glomerulus on each slide MUST be annotated.
+> Unannotated glomerulus = model learns it is background = training error.
 
 - Tool: Brush (**B**), class: `Glomerulus`
-- Paint generously to include Bowman's capsule
-- Coverage: **exhaustive** — all glomeruli on the slide, no exceptions
+- Include Bowman's capsule — slight overshoot acceptable, undershoot is not
+- Coverage: **exhaustive** — no exceptions
 
-### 2.3 Export script for nnU-Net
+### 2.3 Export for nnU-Net (`export_nnunet.groovy`)
 
-Save as `export_nnunet.groovy` in QuPath (**`Automate`** → **`Script editor`** → **`File → Save As`**).
-Run once per slide with that slide open.
+Run once per slide with that slide open in QuPath.
 
 ```groovy
 import qupath.lib.regions.RegionRequest
@@ -246,9 +271,9 @@ ImageIO.write(mask, "PNG", new File("${outputDir}/masks/${imageName}.png"))
 println "✓ Export complete: ${imageName}"
 ```
 
-### 2.4 Import nnU-Net predictions as annotations (for correction)
+### 2.4 Import predictions for correction (`import_nnunet_predictions.groovy`)
 
-Save as `import_nnunet_predictions.groovy`. Change `geojsonPath` for each slide.
+Change `geojsonPath` for each slide. Clears all existing objects first.
 
 ```groovy
 import qupath.lib.io.GsonTools
@@ -260,7 +285,6 @@ def geojsonPath = "/Users/antonino/Desktop/GlomAndreMarc/detections_nnunet/LysM_
 def imageData   = getCurrentImageData()
 def hierarchy   = imageData.getHierarchy()
 
-// Clear everything first
 hierarchy.removeObjects(hierarchy.getFlattenedObjectList(null)
     .findAll { !it.isRootObject() }, true)
 
@@ -274,9 +298,8 @@ def objects = GsonTools.getInstance().fromJson(
 )
 
 def newAnnotations = objects.collect { obj ->
-    def ann = qupath.lib.objects.PathObjects.createAnnotationObject(
+    qupath.lib.objects.PathObjects.createAnnotationObject(
         obj.getROI(), getPathClass("Glomerulus"))
-    return ann
 }
 
 hierarchy.addObjects(newAnnotations)
@@ -284,15 +307,13 @@ fireHierarchyUpdate()
 println "✓ ${newAnnotations.size()} annotations imported"
 ```
 
-After import: add missed glomeruli with Brush (**B**), delete false positives with **Delete** key.
+After import: add missed glomeruli (Brush **B**), delete false positives (**Delete** key).
 
 ---
 
 ## PART 3 — nnU-Net Dataset Preparation
 
 ### 3.1 prepare_nnunet.py
-
-File: `/Users/antonino/QuPath/training/prepare_nnunet.py`
 
 ```python
 import os, json, numpy as np
@@ -337,74 +358,65 @@ with open(base / "dataset.json", "w") as f:
 for p in ["nnUNet_preprocessed", "nnUNet_results"]:
     (Path(NNUNET_DIR) / p).mkdir(parents=True, exist_ok=True)
 
-print(f"\n✓ Dataset ready: {len(cases)} cases: {cases}")
+print(f"\n✓ {len(cases)} cases: {cases}")
 ```
 
-### 3.2 create_split.py
-
-File: `/Users/antonino/QuPath/training/create_split.py`
-
-Adapt to the number of available slides. Current version for 6 slides:
+### 3.2 create_split.py (11 slides version)
 
 ```python
 import json
 from pathlib import Path
 
+slides = ["LysM_01", "LysM_02", "LysM_03", "LysM_04", "LysM_05",
+          "LysM_06", "LysM_07", "LysM_08", "LysM_09", "LysM_10", "LysM_11"]
+
 split = [
-    {"train": ["LysM_01", "LysM_02", "LysM_03", "LysM_04", "LysM_05"], "val": ["LysM_06"]},
-    {"train": ["LysM_01", "LysM_02", "LysM_03", "LysM_04", "LysM_06"], "val": ["LysM_05"]},
-    {"train": ["LysM_01", "LysM_02", "LysM_03", "LysM_05", "LysM_06"], "val": ["LysM_04"]},
-    {"train": ["LysM_01", "LysM_02", "LysM_04", "LysM_05", "LysM_06"], "val": ["LysM_03"]},
-    {"train": ["LysM_01", "LysM_03", "LysM_04", "LysM_05", "LysM_06"], "val": ["LysM_02"]},
+    {"train": [s for s in slides if s not in ["LysM_01", "LysM_02"]], "val": ["LysM_01", "LysM_02"]},
+    {"train": [s for s in slides if s not in ["LysM_03", "LysM_04"]], "val": ["LysM_03", "LysM_04"]},
+    {"train": [s for s in slides if s not in ["LysM_05", "LysM_06"]], "val": ["LysM_05", "LysM_06"]},
+    {"train": [s for s in slides if s not in ["LysM_07", "LysM_08"]], "val": ["LysM_07", "LysM_08"]},
+    {"train": [s for s in slides if s not in ["LysM_09", "LysM_10"]], "val": ["LysM_09", "LysM_10"]},
 ]
 
 out = Path("/Users/antonino/QuPath/nnunet_data/nnUNet_preprocessed/Dataset001_GlomCarstairs/splits_final.json")
 with open(out, "w") as f:
     json.dump(split, f, indent=2)
+
 print(f"✓ Split written: {out}")
+for i, fold in enumerate(split):
+    print(f"   Fold {i}: train={len(fold['train'])} slides | val={fold['val']}")
 ```
 
 ### 3.3 Full training sequence
 
 ```bash
+# 1. Prepare dataset
 python /Users/antonino/QuPath/training/prepare_nnunet.py
+
+# 2. Preprocess
 nnUNetv2_plan_and_preprocess -d 1 --verify_dataset_integrity
+
+# 3. Create split
 python /Users/antonino/QuPath/training/create_split.py
+
+# 4. Train (fold 0, 100 epochs, MPS GPU)
 nnUNetv2_train 1 2d 0 --npz -device mps -tr nnUNetTrainer_100epochs
+
+# To resume after interruption:
+nnUNetv2_train 1 2d 0 --npz -device mps -tr nnUNetTrainer_100epochs --c
 ```
 
----
-
-## PART 4 — Training Results
-
-### Round 1 (3 slides: LysM_01–03)
-
-| Metric | Value |
-|---|---|
-| Training slides | 3 (516 glomeruli) |
-| Epochs | 100 |
-| Epoch time | ~370 sec (M1 Max) |
-| Final validation Dice | **0.765** |
-| Validation slide | LysM_03 |
-
-### Round 2 (6 slides: LysM_01–06)
-
-| Metric | Round 1 | Round 2 |
-|---|---|---|
-| Training slides | 3 | **6** |
-| Glomeruli total | 516 | **1199** |
-| Dice epoch 0 | 0.595 | **0.628** |
-| Dice epoch 1 | 0.649 | **0.726** |
-| Status | Complete | 🔄 In progress |
+> ⚠️ Interrupt safely with **Ctrl+C** at any time.
+> Resume with `--c` flag — picks up from last checkpoint automatically.
 
 ---
 
-## PART 5 — Inference on New Images
+## PART 4 — Inference on New Images
 
-### 5.1 Prepare new images for prediction
+### 4.1 Prepare images
 
 ```bash
-nano /Users/antonino/QuPath/training/prepare_predict.py
+python /Users/antonino/QuPath/training/prepare_predict.py
 ```
 
 ```python
@@ -414,29 +426,22 @@ from pathlib import Path
 from glob import glob
 
 Image.MAX_IMAGE_PIXELS = None
-INPUT_DIR  = "/Users/antonino/Desktop/Export pics"   # ← change for new image set
+INPUT_DIR  = "/Users/antonino/Desktop/Export pics"
 OUTPUT_DIR = "/Users/antonino/QuPath/nnunet_data/predict_input"
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 for p in sorted(glob(f"{INPUT_DIR}/LysM_*.jpg")):
     name = Path(p).stem
     img  = np.array(Image.open(p).convert("RGB"))
-    h, w = img.shape[:2]
-    # Downsample ×4 + green channel
     img_small = img[::4, ::4, 1].astype(np.uint8)
     Image.fromarray(img_small).save(f"{OUTPUT_DIR}/{name}_0000.png")
     print(f"✓ {name}: {img_small.shape}")
 ```
 
-```bash
-python /Users/antonino/QuPath/training/prepare_predict.py
-```
-
-### 5.2 Run prediction
+### 4.2 Predict
 
 ```bash
-source ~/.bash_profile
-conda activate stardist-glom
+source ~/.bash_profile && conda activate stardist-glom
 
 nnUNetv2_predict \
   -i /Users/antonino/QuPath/nnunet_data/predict_input \
@@ -444,9 +449,11 @@ nnUNetv2_predict \
   -d 1 -c 2d -tr nnUNetTrainer_100epochs -f 0 -device mps
 ```
 
-### 5.3 Convert masks to GeoJSON
+### 4.3 Convert to GeoJSON
 
-File: `/Users/antonino/QuPath/training/masks_to_geojson.py`
+```bash
+python /Users/antonino/QuPath/training/masks_to_geojson.py
+```
 
 ```python
 import os, json
@@ -495,16 +502,10 @@ for mask_path in sorted(glob(os.path.join(PRED_DIR, "LysM_*.png"))):
 
     with open(output_json, 'w') as f:
         json.dump({"type": "FeatureCollection", "features": features}, f, indent=2)
-    print(f"✓ {image_name}: {len(features)} glomeruli → {output_json}")
+    print(f"✓ {image_name}: {len(features)} glomeruli")
 ```
 
-```bash
-python /Users/antonino/QuPath/training/masks_to_geojson.py
-```
-
-### 5.4 Import into QuPath
-
-For each image, open the slide in QuPath and run in Script Editor:
+### 4.4 Import into QuPath
 
 ```groovy
 import qupath.lib.io.GsonTools
@@ -512,6 +513,7 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import com.google.gson.JsonParser
 
+// ← Change filename for each slide
 def geojsonPath = "/Users/antonino/Desktop/GlomAndreMarc/detections_nnunet/LysM_01_detections.geojson"
 def imageData   = getCurrentImageData()
 def hierarchy   = imageData.getHierarchy()
@@ -540,60 +542,44 @@ println "✓ ${newAnnotations.size()} glomeruli imported"
 
 ---
 
-## PART 6 — Iterative Training (Active Learning)
+## PART 5 — Pathological Classification (Planned)
 
-Each cycle improves the model:
+### Classification scheme
 
-```
-Predict on new slides → correct in QuPath → add to dataset → retrain
-```
+Designed for inflammatory/autoimmune and ischemia-reperfusion context:
 
-**Workflow per cycle:**
-1. Run `prepare_predict.py` + `nnUNetv2_predict` on new slides
-2. Run `masks_to_geojson.py`
-3. Import in QuPath with `import_nnunet_predictions.groovy`
-4. Correct: add missed glomeruli (Brush **B**), delete false positives (**Delete**)
-5. Export corrected slides with `export_nnunet.groovy`
-6. Update `create_split.py` with new slide names
-7. Run `prepare_nnunet.py` + `nnUNetv2_plan_and_preprocess` + `nnUNetv2_train`
+| Class | Lesion | Typical context |
+|---|---|---|
+| Normal | Preserved architecture | Reference |
+| Inflammatory infiltrate | Intra-glomerular leukocyte infiltration | Autoimmune, vasculitis |
+| Mesangial expansion | Mesangial matrix enlargement ± hypercellularity | IgA, lupus |
+| Crescent | Epithelial/fibrous crescent | Rapidly progressive GN |
+| Global sclerosis | Obsolescent glomerulus | End-stage all GN |
+| Segmental sclerosis | Segmental fibrosis | Post-inflammatory FSGS |
+| Ischemic collapse | Flocculus collapse | Ischemia-reperfusion |
+| Thrombosis | Intracapillary thrombus | Vasculitis, severe I-R |
 
----
+### Planned technical stack
 
-## PART 7 — Pathological Classification (Planned)
-
-### Planned approach
-
-1. **Patch extraction** — crop each detected glomerulus from the full-resolution image
-2. **GUI sorting tool** — local web interface displaying glomerulus patches as a grid
-   - Click buttons: `Healthy` / `Pathological` / `Uncertain`
-   - Labels saved to CSV
-   - Semi-automatic: classifier proposes labels after initial batch, user validates
-3. **Train classifier** — on labeled patches (ResNet or simple CNN)
-4. **Auto-classify in QuPath** — apply classifier to all detected glomeruli, display results
-
-### Technical stack (planned)
-- Patch extraction: Python + PIL
-- GUI: Python/Flask local web app or standalone React app
-- Classifier: PyTorch (MPS GPU), transfer learning from pretrained ResNet
-- QuPath integration: GeoJSON with classification property
+- Patch extraction: Python + PIL (crop each glomerulus from full-res image)
+- GUI: local web app (Flask or React) — grid display with click-to-classify
+- Classifier: PyTorch ResNet (transfer learning), MPS GPU
+- Output: GeoJSON with classification property → import in QuPath
 
 ---
 
 ## Technical Notes
 
-- Glomerulus diameter: **~200 px** at full resolution (measured: 204 px)
-- Export downsample: **×4** → images ~7200×4060 px for nnU-Net
-- Annotation rule: **exhaustive per slide** — every visible glomerulus must be labeled
-- Staining: **Carstairs** — color deconvolution not applicable
-- Optimal channel: **Green (index 1)** — best contrast for Carstairs
-- GPU backend: **Apple MPS** (Metal) — always use `-device mps`, never cuda
-- PyTorch: 2.11.0 | TensorFlow: 2.16.2 | nnU-Net: 2.7.0
-- numpy must stay at **1.26.4** — verify after every pip install
-- Images: 11 slides, ~469M pixels each (28928×16240 or 28800×16240 px)
-
-## Dataset History
-
-| Round | Slides | Glomeruli | Val Dice | Notes |
-|---|---|---|---|---|
-| Round 1 | 3 | 516 | 0.765 | Manual annotations only |
-| Round 2 | 6 | 1199 | TBD | +3 slides corrected from predictions |
+| Parameter | Value |
+|---|---|
+| Glomerulus diameter | ~200 px at full resolution |
+| Export downsample | ×4 → ~7200×4060 px |
+| Annotation rule | Exhaustive per slide — no exceptions |
+| Staining | Carstairs — color deconvolution not applicable |
+| Optimal channel | Green (index 1) |
+| GPU backend | Apple MPS (Metal) — always `-device mps` |
+| PyTorch | 2.11.0 |
+| TensorFlow | 2.16.2 |
+| nnU-Net | 2.7.0 |
+| numpy | Must stay at 1.26.4 — verify after every pip install |
+| Image size | ~469M pixels (28928×16240 or 28800×16240 px) |
