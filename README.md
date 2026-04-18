@@ -356,7 +356,7 @@ println "✓ ${newAnnotations.size()} classified glomeruli imported with measure
 ```bash
 source ~/.bash_profile && conda activate stardist-glom
 
-python /Users/antonino/QuPath/training/prepare_nnunet.py
+python training/prepare_nnunet.py
 nnUNetv2_plan_and_preprocess -d 1 --verify_dataset_integrity
 python /Users/antonino/QuPath/training/create_split.py
 nnUNetv2_train 1 2d 0 --npz -device mps -tr nnUNetTrainer_100epochs
